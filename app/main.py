@@ -105,7 +105,7 @@ async def ask(req: AskReq):
         "You ONLY return exact text copied from the provided context. "
         "Do not paraphrase, summarize, add words, or reorder sentences. "
         "Select the most relevant 1–3 passages and return them as bullet points, "
-        "each prefixed with '- ' and copied verbatim. "
+        "each on a new line prefixed with '- ' and copied verbatim. "
         "If nothing is relevant, reply exactly: No exact answer found in the document."
     )
     user = (
