@@ -222,6 +222,14 @@ def widget_js():
 })();
 """.strip()
 
+@app.get("/stats")
+def stats():
+    try:
+        count = COLL.count()
+    except Exception as e:
+        count = f"error: {e}"
+    return {"collection": "shoulder_docs", "count": count}
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """<!DOCTYPE html>
