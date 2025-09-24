@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: drqa-med
+    env: docker
+    plan: free
+    autoDeploy: true
+    disk:
+      name: drqa-data
+      mountPath: /data
+      sizeGB: 2
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ALLOW_ORIGINS
+        value: https://*.webflow.io,https://yourdomain.com
+    healthCheckPath: /health
