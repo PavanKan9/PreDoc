@@ -46,6 +46,7 @@ class AskReq(BaseModel):
     conversation_id: Optional[str] = None
     topic: Optional[str] = "shoulder"
     max_suggestions: int = 4
+    avoid: List[str] = []  # NEW: chips to avoid repeating
 
 class AskResp(BaseModel):
     answer: str
@@ -54,11 +55,20 @@ class AskResp(BaseModel):
     safety: dict
     disclaimer: str = "Educational information only — not medical advice."
 
-# ===== Routes =====
+# ===== Utility / debug =====
 @app.get("/health")
 def health():
     return {"ok": True}
 
+@app.get("/stats")
+def stats():
+    try:
+        count = COLL.count()
+    except Exception as e:
+        count = f"error: {e}"
+    return {"collection": "shoulder_docs", "count": count}
+
+# ===== Ingest =====
 @app.post("/ingest")
 async def ingest_file(file: UploadFile = File(...), topic: str = Form("shoulder")):
     """
@@ -82,56 +92,42 @@ async def ingest_file(file: UploadFile = File(...), topic: str = Form("shoulder"
         )
     return {"added": len(chunks)}
 
+# ===== Ask (verbatim bullets + dynamic pills) =====
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
     """
-    Verbatim, extractive answer from indexed docs.
-    - Returns 1–3 exact passages as bullet points (no paraphrase).
-    - practice_notes present but null.
-    - suggestions generated (LLM with fallback defaults).
-    - safety triage applied; urgent pill prepended if flagged.
+    Returns 1–3 verbatim passages as bullet points (no paraphrase).
+    Pills adapt to the last Q+A; urgent care pill prepended if flagged.
     """
     q = req.question.strip()
     topic = (req.topic or "shoulder").lower()
 
-    # 1) Retrieve top-k context (same topic)
-    res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
-    top_docs = res.get("documents", [[]])[0]
-    # Build a compact context (up to 3 chunks)
-    context = "\n\n---\n\n".join(top_docs[:3]) if top_docs else ""
+    # 1) Retrieve top-k context (try with topic, then without)
+    res = COLL.query(query_texts=[q], n_results=3, where={"topic": topic})
+    docs = res.get("documents", [[]])[0]
+    if not docs:
+        res = COLL.query(query_texts=[q], n_results=3)
+        docs = res.get("documents", [[]])[0]
 
-    # 2) Verbatim extractive prompt -> bullet points
-    system = (
-        "You ONLY return exact text copied from the provided context. "
-        "Do not paraphrase, summarize, add words, or reorder sentences. "
-        "Select the most relevant 1–3 passages and return them as bullet points, "
-        "each on a new line prefixed with '- ' and copied verbatim. "
-        "If nothing is relevant, reply exactly: No exact answer found in the document."
-    )
-    user = (
-        f"Patient question: {q}\n\n"
-        f"Context (verbatim source):\n{context}\n\n"
-        "Return 1–3 bullet points, each an exact passage from the context. "
-        "Do not include any text not present in the context."
-    )
+    # 2) Build bullet-point answer directly from retrieved text (no LLM)
+    if docs:
+        answer = "\n".join(f"- {d}" for d in docs[:3])
+    else:
+        answer = "No exact answer found in the document."
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.0,  # deterministic and discourages paraphrase
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-    )
-    answer = resp.choices[0].message.content.strip()
-
-    # 3) Safety triage (question + answer)
+    # 3) Safety triage (based on Q + returned answer)
     safety = triage_flags(q + "\n" + (answer or ""))
 
-    # 4) Suggestions (prefer LLM, fallback to defaults)
-    suggestions = gen_suggestions(q, answer, topic=topic or "shoulder", k=req.max_suggestions)
+    # 4) Suggestions (model-driven with avoidance list; fallback defaults)
+    suggestions = gen_suggestions(
+        q, answer, topic=topic or "shoulder", k=req.max_suggestions, avoid=req.avoid
+    )
 
     # 5) Urgent pill on top if flagged
-    urgent = {"urgent_care": "Seek urgent care — learn more",
-              "er": "Call emergency services — what to do now"}
+    urgent = {
+        "urgent_care": "Seek urgent care — learn more",
+        "er": "Call emergency services — what to do now",
+    }
     if safety["triage"] in urgent:
         label = urgent[safety["triage"]]
         suggestions = [label] + [s for s in suggestions if s != label]
@@ -139,11 +135,12 @@ async def ask(req: AskReq):
 
     return AskResp(
         answer=answer,
-        practice_notes=None,  # explicitly no practice notes in this mode
+        practice_notes=None,  # keep field but don't use it
         suggestions=suggestions,
         safety=safety,
     )
 
+# ===== Widget JS (line-break fix for bullets) =====
 @app.get("/widget.js", response_class=PlainTextResponse)
 def widget_js():
     # Minimal, dependency-free widget script
@@ -175,13 +172,17 @@ def widget_js():
   function addMsg(text, who){
     var d = document.createElement("div");
     d.style.padding="10px 12px"; d.style.borderRadius="12px"; d.style.lineHeight="1.35";
+    d.style.whiteSpace = "pre-wrap"; // <-- preserve bullets & newlines
     if(who==="user"){ d.style.background="#eef2ff"; d.style.alignSelf="flex-end"; }
-    else { d.style.background="#f4f4f5"; whiteSpace="pre-wrap"; }
+    else { d.style.background="#f4f4f5"; }
     d.textContent = text;
     msgs.appendChild(d); msgs.scrollTop = msgs.scrollHeight;
   }
 
+  var lastSuggestions = [];
+
   function renderPills(arr){
+    lastSuggestions = Array.isArray(arr) ? arr.slice(0) : [];
     pills.innerHTML = "";
     (arr||[]).forEach(function(label){
       var b = document.createElement("button");
@@ -197,10 +198,11 @@ def widget_js():
   async function ask(q){
     addMsg(q, "user"); input.value="";
     try{
+      const body = { question: q, topic: TOPIC, avoid: lastSuggestions }; // send previous chips to avoid repeats
       var res = await fetch(API + "/ask", {
         method: "POST",
         headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ question: q, topic: TOPIC })
+        body: JSON.stringify(body)
       });
       var data = await res.json();
       addMsg(data.answer, "bot");
@@ -221,14 +223,6 @@ def widget_js():
   });
 })();
 """.strip()
-
-@app.get("/stats")
-def stats():
-    try:
-        count = COLL.count()
-    except Exception as e:
-        count = f"error: {e}"
-    return {"collection": "shoulder_docs", "count": count}
 
 @app.get("/", response_class=HTMLResponse)
 def home():
