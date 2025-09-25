@@ -46,7 +46,7 @@ class AskReq(BaseModel):
     conversation_id: Optional[str] = None
     topic: Optional[str] = "shoulder"
     max_suggestions: int = 4
-    avoid: List[str] = []  # NEW: chips to avoid repeating
+    avoid: List[str] = []  # chips to avoid repeating
 
 class AskResp(BaseModel):
     answer: str
@@ -92,33 +92,61 @@ async def ingest_file(file: UploadFile = File(...), topic: str = Form("shoulder"
         )
     return {"added": len(chunks)}
 
-# ===== Ask (verbatim bullets + dynamic pills) =====
+# ===== Ask (concise paraphrase 2–3 lines + dynamic pills) =====
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
     """
-    Returns 1–3 verbatim passages as bullet points (no paraphrase).
-    Pills adapt to the last Q+A; urgent care pill prepended if flagged.
+    Returns a concise 2–3 line answer (slight paraphrase) grounded in retrieved passages.
+    Pills adapt to the last Q+A; urgent care pill is prepended if flagged.
     """
     q = req.question.strip()
     topic = (req.topic or "shoulder").lower()
 
     # 1) Retrieve top-k context (try with topic, then without)
-    res = COLL.query(query_texts=[q], n_results=3, where={"topic": topic})
+    res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
     docs = res.get("documents", [[]])[0]
     if not docs:
-        res = COLL.query(query_texts=[q], n_results=3)
+        res = COLL.query(query_texts=[q], n_results=5)
         docs = res.get("documents", [[]])[0]
 
-    # 2) Build bullet-point answer directly from retrieved text (no LLM)
-    if docs:
-        answer = "\n".join(f"- {d}" for d in docs[:3])
-    else:
-        answer = "No exact answer found in the document."
+    # Limit context size fed to the model to keep it focused and brief
+    context = "\n\n---\n\n".join(docs[:3]) if docs else ""
+    if len(context) > 1800:
+        context = context[:1800]
+
+    # 2) Short summarizer prompt (slight paraphrase, max ~60 words)
+    summary_prompt = f"""
+You are a medical educator. Write a concise explanation in 2–3 lines (max ~60 words),
+based only on the context below. Slightly paraphrase so it is clear and easy to read.
+Do not include unrelated details, do not give medical advice, and do not mention drugs or dosages.
+
+Context:
+{context}
+
+Question: {q}
+    """.strip()
+
+    answer = "No relevant information found in the document."
+    if context:
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.4,
+                messages=[{"role": "user", "content": summary_prompt}],
+            )
+            candidate = resp.choices[0].message.content.strip()
+            # Hard cap length to keep it tight
+            if len(candidate) > 420:
+                candidate = candidate[:420].rstrip()
+            answer = candidate
+        except Exception:
+            # keep fallback text if model call fails
+            pass
 
     # 3) Safety triage (based on Q + returned answer)
     safety = triage_flags(q + "\n" + (answer or ""))
 
-    # 4) Suggestions (model-driven with avoidance list; fallback defaults)
+    # 4) Suggestions (model-driven with avoidance list; fallback handled in sugg.py)
     suggestions = gen_suggestions(
         q, answer, topic=topic or "shoulder", k=req.max_suggestions, avoid=req.avoid
     )
@@ -140,7 +168,7 @@ async def ask(req: AskReq):
         safety=safety,
     )
 
-# ===== Widget JS (line-break fix for bullets) =====
+# ===== Widget JS (preserve line breaks; dynamic pills) =====
 @app.get("/widget.js", response_class=PlainTextResponse)
 def widget_js():
     # Minimal, dependency-free widget script
@@ -172,7 +200,7 @@ def widget_js():
   function addMsg(text, who){
     var d = document.createElement("div");
     d.style.padding="10px 12px"; d.style.borderRadius="12px"; d.style.lineHeight="1.35";
-    d.style.whiteSpace = "pre-wrap"; // <-- preserve bullets & newlines
+    d.style.whiteSpace = "pre-wrap"; // preserve newlines
     if(who==="user"){ d.style.background="#eef2ff"; d.style.alignSelf="flex-end"; }
     else { d.style.background="#f4f4f5"; }
     d.textContent = text;
@@ -198,7 +226,7 @@ def widget_js():
   async function ask(q){
     addMsg(q, "user"); input.value="";
     try{
-      const body = { question: q, topic: TOPIC, avoid: lastSuggestions }; // send previous chips to avoid repeats
+      const body = { question: q, topic: TOPIC, avoid: lastSuggestions };
       var res = await fetch(API + "/ask", {
         method: "POST",
         headers: {"Content-Type":"application/json"},
@@ -213,7 +241,7 @@ def widget_js():
     }
   }
 
-  // Show a few defaults before first answer:
+  // Defaults shown before first answer:
   renderPills(["What is shoulder arthroscopy?","What are the risks?","What is recovery like?","When can I drive?"]);
 
   form.addEventListener("submit", function(ev){
@@ -224,7 +252,7 @@ def widget_js():
 })();
 """.strip()
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_model=None, response_class=HTMLResponse)
 def home():
     return """<!DOCTYPE html>
 <html lang="en"><head>
@@ -236,6 +264,6 @@ def home():
 </head>
 <body>
   <div id="drqa-root"></div>
-  <script src="/widget.js" defer></script>
+  <script src="/widget.js?v=5" defer></script>
 </body>
 </html>"""
