@@ -283,10 +283,6 @@ def widget_js():
       addMsg(data.answer, "bot");
       if (data.practice_notes) addMsg(data.practice_notes, "bot");
 
-      if (data.verified === false) {
-        addMsg("Note: This answer is general educational content and hasn’t been verified by your clinic.", "bot");
-      }
-
       renderPills(data.suggestions || []);
     }catch(e){
       addMsg("Sorry — something went wrong. Please try again.", "bot");
