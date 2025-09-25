@@ -200,7 +200,7 @@ Return only the explanation text.
         verified=verified,
     )
 
-# ===== Widget JS (spinner + preserved line breaks + dynamic pills) =====
+# ===== Widget JS (Apple-like polish + spinner + question pills) =====
 @app.get("/widget.js", response_class=PlainTextResponse)
 def widget_js():
     return """
@@ -214,26 +214,96 @@ def widget_js():
 
   root.innerHTML = `
   <style>
-    /* Simple spinner (Chrome-like) */
-    .drqa-spinner {
-      width: 22px; height: 22px; border-radius: 50%;
-      border: 3px solid rgba(0,0,0,0.1);
-      border-top-color: rgba(0,0,0,0.55);
-      animation: drqa-spin 0.8s linear infinite;
-      display: none; margin-left: 8px;
+    :root {
+      --bg: #f5f5f7;
+      --card: #ffffff;
+      --text: #111111;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --pill: #f9fafb;
+      --pill-border: #e5e7eb;
+      --user: #e8eefc;
+      --bot: #f6f7f8;
+      --accent: #111827;
+      --shadow: 0 10px 30px rgba(0,0,0,0.08);
+      --radius: 14px;
     }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0b0c;
+        --card: #111113;
+        --text: #f5f5f7;
+        --muted: #9aa1aa;
+        --border: #1f2125;
+        --pill: #0f1012;
+        --pill-border: #24262b;
+        --user: #12233f;
+        --bot: #151617;
+        --accent: #e5e7eb;
+        --shadow: 0 8px 28px rgba(0,0,0,0.45);
+      }
+    }
+
+    body{ background: var(--bg); }
+    .drqa-wrap{ max-width: 760px; margin: 0 auto; padding: 32px 20px 56px; }
+    .drqa-card{ background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+    .drqa-head{ padding: 18px 22px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+    .drqa-title{ font-size: 18px; font-weight: 600; letter-spacing: .2px; }
+    .drqa-topic{ font-size: 13px; color: var(--muted); border:1px solid var(--border); padding: 6px 10px; border-radius: 999px; background: var(--pill); }
+    .drqa-body{ padding: 10px 22px 18px; }
+    .drqa-messages{ display:flex; flex-direction:column; gap:12px; padding: 16px 0; min-height: 200px; }
+    .drqa-bubble{ max-width: 85%; padding: 11px 13px; line-height: 1.45; border-radius: 14px; white-space: pre-wrap; border: 1px solid var(--border); opacity: 0; transform: translateY(4px); animation: drqa-in .18s ease forwards; }
+    .drqa-bubble.user{ align-self:flex-end; background: var(--user); }
+    .drqa-bubble.bot{ align-self:flex-start; background: var(--bot); }
+    @keyframes drqa-in { to { opacity:1; transform: translateY(0); } }
+
+    .drqa-pills{ display:flex; flex-wrap:wrap; gap:8px; padding: 6px 0 12px; }
+    .drqa-pill{ border:1px solid var(--pill-border); background: var(--pill); border-radius: 999px; padding: 8px 12px; cursor:pointer; font-size: 14px; transition: all .15s ease; user-select:none; }
+    .drqa-pill:hover{ transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+    .drqa-pill:active{ transform: translateY(0); }
+
+    .drqa-form{ display:flex; gap:10px; align-items:center; padding-top: 8px; border-top: 1px solid var(--border); margin-top: 8px; }
+    .drqa-input{ flex:1; padding: 12px 14px; border:1px solid var(--border); border-radius: 12px; background: transparent; color: var(--text); outline: none; transition: border-color .15s ease, box-shadow .15s ease; font-size: 15px; }
+    .drqa-input:focus{ border-color: #9ca3af; box-shadow: 0 0 0 3px rgba(156,163,175,0.2); }
+    .drqa-btn{ padding: 11px 16px; border:0; border-radius:12px; background: var(--accent); color:#fff; cursor:pointer; font-weight:600; transition: opacity .15s ease, transform .15s ease; }
+    .drqa-btn:hover{ opacity:.92; transform: translateY(-1px); }
+    .drqa-btn:active{ transform: translateY(0); }
+
+    .drqa-foot{ padding: 10px 22px 16px; color: var(--muted); font-size: 12px; }
+
+    /* Spinner */
+    .drqa-spinner { width: 22px; height: 22px; border-radius: 50%; border: 3px solid rgba(0,0,0,0.12); border-top-color: rgba(0,0,0,0.55); animation: drqa-spin 0.8s linear infinite; display: none; }
+    @media (prefers-color-scheme: dark){ .drqa-spinner{ border-color: rgba(255,255,255,0.12); border-top-color: rgba(255,255,255,0.6); } }
     @keyframes drqa-spin { to { transform: rotate(360deg); } }
   </style>
-  <div class="drqa-box" style="max-width:680px;margin:0 auto;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
-    <div id="drqa-messages" style="display:flex;flex-direction:column;gap:12px;padding:8px 0;"></div>
-    <div id="drqa-pills" style="display:flex;flex-wrap:wrap;gap:8px;padding:6px 0 12px;"></div>
-    <form id="drqa-form" style="display:flex;gap:8px;align-items:center;">
-      <input id="drqa-input" type="text" placeholder="Ask about your shoulder…" autocomplete="off" style="flex:1;padding:10px;border:1px solid #ddd;border-radius:8px;">
-      <div id="drqa-spinner" class="drqa-spinner" aria-label="thinking"></div>
-      <button type="submit" style="padding:10px 14px;border:0;border-radius:8px;background:#111827;color:#fff;cursor:pointer;">Ask</button>
-    </form>
-    <div style="margin-top:8px;font-size:12px;color:#6b7280;">Educational information only — not medical advice.</div>
-  </div>`;
+
+  <div class="drqa-wrap">
+    <div class="drqa-card">
+      <div class="drqa-head">
+        <div class="drqa-title">Patient Education</div>
+        <div class="drqa-topic">Topic: <span id="drqa-topic-text"></span></div>
+      </div>
+
+      <div class="drqa-body">
+        <div id="drqa-messages" class="drqa-messages"></div>
+        <div id="drqa-pills" class="drqa-pills"></div>
+
+        <form id="drqa-form" class="drqa-form">
+          <input id="drqa-input" class="drqa-input" type="text" placeholder="Ask about your shoulder…" autocomplete="off">
+          <div id="drqa-spinner" class="drqa-spinner" aria-label="thinking"></div>
+          <button type="submit" class="drqa-btn">Ask</button>
+        </form>
+      </div>
+
+      <div class="drqa-foot">
+        Educational information only — not medical advice.
+      </div>
+    </div>
+  </div>
+  `;
+
+  var topicEl = root.querySelector("#drqa-topic-text");
+  topicEl.textContent = (TOPIC.charAt(0).toUpperCase() + TOPIC.slice(1));
 
   var msgs = root.querySelector("#drqa-messages");
   var pills = root.querySelector("#drqa-pills");
@@ -243,10 +313,7 @@ def widget_js():
 
   function addMsg(text, who){
     var d = document.createElement("div");
-    d.style.padding="10px 12px"; d.style.borderRadius="12px"; d.style.lineHeight="1.35";
-    d.style.whiteSpace = "pre-wrap"; // preserve newlines
-    if(who==="user"){ d.style.background="#eef2ff"; d.style.alignSelf="flex-end"; }
-    else { d.style.background="#f4f4f5"; }
+    d.className = "drqa-bubble " + (who==="user" ? "user" : "bot");
     d.textContent = text;
     msgs.appendChild(d); msgs.scrollTop = msgs.scrollHeight;
   }
@@ -259,10 +326,12 @@ def widget_js():
     (arr||[]).forEach(function(label){
       var b = document.createElement("button");
       b.type = "button";
-      b.textContent = label.endsWith("?") ? label : (label + "?"); // force question style
-      b.style.border="1px solid #ddd"; b.style.borderRadius="999px"; b.style.padding="6px 10px";
-      b.style.cursor="pointer"; b.style.fontSize="14px"; b.style.background="#fff";
-      b.onclick = function(){ input.value = b.textContent; form.dispatchEvent(new Event("submit",{cancelable:true})); };
+      b.className = "drqa-pill";
+      b.textContent = label.endsWith("?") ? label : (label + "?"); // ensure questions
+      b.onclick = function(){
+        input.value = b.textContent;
+        form.dispatchEvent(new Event("submit",{cancelable:true}));
+      };
       pills.appendChild(b);
     });
   }
@@ -282,7 +351,6 @@ def widget_js():
       var data = await res.json();
       addMsg(data.answer, "bot");
       if (data.practice_notes) addMsg(data.practice_notes, "bot");
-
       renderPills(data.suggestions || []);
     }catch(e){
       addMsg("Sorry — something went wrong. Please try again.", "bot");
@@ -291,8 +359,13 @@ def widget_js():
     }
   }
 
-  // Defaults before first answer
-  renderPills(["What is shoulder arthroscopy?","When is it recommended?","What are the risks?","How long is recovery?"]);
+  // Defaults (first render)
+  renderPills([
+    "What is shoulder arthroscopy?",
+    "When is it recommended?",
+    "What are the risks?",
+    "How long is recovery?"
+  ]);
 
   form.addEventListener("submit", function(ev){
     ev.preventDefault();
@@ -305,15 +378,33 @@ def widget_js():
 @app.get("/", response_model=None, response_class=HTMLResponse)
 def home():
     return """<!DOCTYPE html>
-<html lang="en"><head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Patient Education Chat</title>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Patient Education</title>
+  <meta name="color-scheme" content="light dark">
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f9fafb;display:flex;justify-content:center;padding:40px;}
+    html,body{height:100%;}
+    body{
+      margin:0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Inter, system-ui, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: linear-gradient(180deg, #f5f5f7 0%, #ffffff 100%);
+    }
+    @media (prefers-color-scheme: dark){
+      body{ background: linear-gradient(180deg, #0b0b0c 0%, #0f1012 100%); }
+    }
+    .frame{
+      min-height:100%;
+      display:flex; align-items:flex-start; justify-content:center;
+      padding: 42px 18px 80px;
+    }
   </style>
 </head>
 <body>
-  <div id="drqa-root"></div>
-  <script src="/widget.js?v=7" defer></script>
+  <div class="frame">
+    <div id="drqa-root"></div>
+  </div>
+  <script src="/widget.js?v=10" defer></script>
 </body>
 </html>"""
