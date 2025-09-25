@@ -13,14 +13,20 @@ DEFAULTS = {
     ],
 }
 
-SUGGESTION_SYSTEM = """You generate 3–5 SHORT, SAFE quick-reply chips for a patient-education chat.
+SUGGESTION_SYSTEM = """You generate 3–5 SHORT, SAFE follow-up QUESTIONS for a patient-education chat.
+
 Rules:
-- ≤ 45 characters per chip. Sentence case. Patient-friendly.
-- Base chips on BOTH the user’s last question AND the assistant’s last answer.
-- Prefer clear next learning steps: risks, recovery, activities, when to call a clinician.
-- Do NOT diagnose or prescribe treatment. Avoid drug names/dosages.
-- If an 'avoid' list is provided, do not repeat those topics or phrasings.
-- Output ONLY a JSON array of strings.
+- Each chip must be phrased as a QUESTION (e.g., "What are the risks of this surgery?").
+- ≤ 45 characters. Patient-friendly, sentence case.
+- Base chips on the user’s last question AND the assistant’s last answer.
+- The goal is to let the patient dive deeper into related subtopics.
+- Avoid duplication with previous chips (use 'avoid' list).
+- Do NOT diagnose or prescribe treatment. No drug names/dosages.
+- If red flags (fever + swelling, deformity, numbness/weakness) → include urgent chip: 
+  "Should I seek urgent care?".
+- Output ONLY a JSON array of question strings.
+"""
+
 """
 
 def clean_chips(arr: List[str], k: int, avoid: List[str]) -> List[str]:
