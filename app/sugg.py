@@ -27,8 +27,6 @@ Rules:
 - Output ONLY a JSON array of question strings.
 """
 
-"""
-
 def clean_chips(arr: List[str], k: int, avoid: List[str]) -> List[str]:
     seen = {s.lower().strip() for s in (avoid or [])}
     out: List[str] = []
