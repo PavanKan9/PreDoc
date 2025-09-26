@@ -118,83 +118,145 @@ def first_two_sents(txt: str) -> str:
     sents = re.split(r"(?<=[.!?])\s+", txt.strip())
     return " ".join(sents[:2]).strip()
 
-# --- Helper to validate suggestions ---
+# ---------- Helpers (put directly above /ask) ----------
+
+def _normalize(txt: str) -> str:
+    """Trim, collapse whitespace, and strip obvious Q:/A: headers."""
+    import re
+    if not isinstance(txt, str):
+        return ""
+    t = txt.strip()
+    t = re.sub(r"\s+", " ", t)                                  # collapse runs of whitespace
+    t = re.sub(r"(?:^|\n)(Q:|Question:).*?$", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"(?:^|\n)(A:|Answer:).*?$", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
 def filter_suggestions_in_doc(suggestions: List[str], topic: str, limit: int = 4) -> List[str]:
-    good = []
-    for s in suggestions:
-        res = COLL.query(query_texts=[s], n_results=1, where={"topic": topic})
-        docs = res.get("documents", [[]])[0]
-        if docs:  # only keep if we got something back
-            good.append(s)
-        if len(good) >= limit:
-            break
+    """Keep only pills that the topic-scoped retriever can actually answer."""
+    good: List[str] = []
+    for s in (suggestions or []):
+        try:
+            res = COLL.query(query_texts=[s], n_results=1, where={"topic": topic})
+            docs = res.get("documents", [[]])[0]
+            if docs:
+                good.append(s)
+                if len(good) >= limit:
+                    break
+        except Exception:
+            # ignore a single bad query and continue
+            pass
     return good
-    
+
+CURATED_DEFAULTS = {
+    "shoulder": [
+        "What is shoulder arthroscopy?",
+        "When is it recommended?",
+        "What are the risks?",
+        "How long is recovery?"
+    ],
+    # Add more topics later as you ingest them:
+    "knee": [
+        "What is knee arthroscopy?",
+        "When is it recommended?",
+        "What are the risks?",
+        "How long is recovery?"
+    ],
+}
+
+NO_MATCH_MESSAGE = (
+    "I couldn’t find this answered in the clinic’s provided materials. "
+    "You can try rephrasing your question, or ask your clinician directly."
+)
+
+# ------------------------- /ask -------------------------
+
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
     q = (req.question or "").strip()
     topic = (req.topic or "shoulder").lower()
 
-    # --- Query Chroma (topic scoped) ---
-    res = COLL.query(
-        query_texts=[q],
-        n_results=5,
-        where={"topic": topic}
-    )
-    docs = res.get("documents", [[]])[0]
-
-    # Optional fallback: global search if no docs for this topic
-    if not docs:
-        res = COLL.query(query_texts=[q], n_results=5)
+    # 1) Topic-scoped retrieval only (keeps answers on-topic)
+    try:
+        res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
         docs = res.get("documents", [[]])[0]
+    except Exception:
+        docs = []
 
-    # If nothing at all → politely decline
+    # If nothing at all → politely decline (no generic fallback)
     if not docs:
         return AskResp(
-            answer="I couldn’t find this answered in the clinic’s provided materials. "
-                   "You can try rephrasing your question, or ask your clinician directly.",
+            answer=NO_MATCH_MESSAGE,
             practice_notes=None,
-            suggestions=[
-                "What is shoulder arthroscopy?",
-                "When is it recommended?",
-                "What are the risks?",
-                "How long is recovery?"
-            ],
+            suggestions=(CURATED_DEFAULTS.get(topic) or CURATED_DEFAULTS["shoulder"])[: req.max_suggestions],
             safety={"triage": None},
             verified=False,
         )
 
-    # --- Summarize into a concise answer ---
+    # 2) Build a clean, tight context from the top chunks
+    clean_docs = [_normalize(d) for d in docs[:3] if isinstance(d, str) and d.strip()]
+    context = "\n\n---\n\n".join(clean_docs) if clean_docs else ""
+    if len(context) > 1800:
+        context = context[:1800]
+
+    if not context:
+        return AskResp(
+            answer=NO_MATCH_MESSAGE,
+            practice_notes=None,
+            suggestions=(CURATED_DEFAULTS.get(topic) or CURATED_DEFAULTS["shoulder"])[: req.max_suggestions],
+            safety={"triage": None},
+            verified=False,
+        )
+
+    # 3) Concise paraphrase strictly from clinic context (no chit-chat)
+    summary_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a medical educator. Answer ONLY from the provided clinic context. "
+                "Write 2–3 short sentences (45–80 words), clear and neutral. "
+                "No chit-chat, no pleasantries, no first-person, no advice or dosing."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Question: {q}\n\nClinic context:\n{context}",
+        },
+    ]
+
     try:
-        answer = oai.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a medical explainer. Answer in 2–3 short, plain sentences, based only on clinic material."},
-                {"role": "user", "content": f"Question: {q}\n\nContext:\n{docs}"}
-            ],
-            max_tokens=200,
-        ).choices[0].message.content.strip()
+            temperature=0.2,
+            messages=summary_messages,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
     except Exception:
-        # fallback to raw doc snippet
-        answer = " ".join(docs[:2])
+        # last-ditch fallback: trimmed snippet from top chunk
+        answer = clean_docs[0][:300] if clean_docs else NO_MATCH_MESSAGE
 
-    # --- Generate pills, then filter them against doc ---
-    raw_sugs = gen_suggestions(q, docs)
-    suggestions = filter_suggestions_in_doc(raw_sugs, topic)
-    if not suggestions:
-        suggestions = [
-            "What is shoulder arthroscopy?",
-            "When is it recommended?",
-            "What are the risks?",
-            "How long is recovery?"
-        ]
+    # 4) Safety triage (guarded)
+    try:
+        safety = triage_flags(q + "\n" + answer) or {"triage": None}
+    except Exception:
+        safety = {"triage": None}
 
-    # --- Build response ---
+    # 5) Suggestions → validate against doc; fallback to curated defaults if empty
+    try:
+        model_sugs = gen_suggestions(
+            q, answer, topic=topic, k=req.max_suggestions, avoid=req.avoid
+        ) or []
+    except Exception:
+        model_sugs = []
+
+    filtered = filter_suggestions_in_doc(model_sugs, topic, limit=req.max_suggestions)
+    if not filtered:
+        filtered = (CURATED_DEFAULTS.get(topic) or CURATED_DEFAULTS["shoulder"])[: req.max_suggestions]
+
     return AskResp(
         answer=answer,
         practice_notes=None,
-        suggestions=suggestions,
-        safety={"triage": None},
+        suggestions=filtered,
+        safety=safety,
         verified=True,
     )
 
@@ -439,6 +501,6 @@ def home():
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=11" defer></script>
+  <script src="/widget.js?v=12" defer></script>
 </body>
 </html>"""
