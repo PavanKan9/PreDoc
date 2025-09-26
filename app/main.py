@@ -72,6 +72,18 @@ def stats():
         count = f"error: {e}"
     return {"collection": "shoulder_docs", "count": count}
 
+@app.post("/reset")
+def reset():
+    # DANGER: wipes the shoulder_docs collection
+    try:
+        persist.delete_collection("shoulder_docs")
+    except Exception:
+        pass
+    global COLL
+    COLL = persist.get_or_create_collection(name="shoulder_docs", embedding_function=embedder)
+    return {"ok": True}
+
+
 # ===== Ingest =====
 @app.post("/ingest")
 async def ingest_file(file: UploadFile = File(...), topic: str = Form("shoulder")):
