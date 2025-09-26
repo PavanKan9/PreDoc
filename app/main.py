@@ -123,62 +123,73 @@ async def ask(req: AskReq):
     q = (req.question or "").strip()
     topic = (req.topic or "shoulder").lower()
 
-    # --- Query Chroma ---
-    res = COLL.query(
-        query_texts=[q],
-        n_results=5,
-        where={"topic": topic}
-    )
+    NO_MATCH = ("I couldn’t find this answered in the clinic’s provided materials. "
+                "You can try rephrasing your question, or ask your clinician directly.")
+
+    # 1) STRICT: topic-scoped retrieval only
+    res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
     docs = res.get("documents", [[]])[0]
 
-    # Fallback: global search if no docs for topic
-    if not docs:
-        res = COLL.query(query_texts=[q], n_results=5)
-        docs = res.get("documents", [[]])[0]
-
-    # If nothing at all → politely decline
+    # nothing? -> not covered (no generic fallback)
     if not docs:
         return AskResp(
-            answer="I couldn’t find this answered in the clinic’s provided materials. "
-                   "You can try rephrasing your question, or ask your clinician directly.",
+            answer=NO_MATCH,
             practice_notes=None,
             suggestions=[],
             safety={"triage": None},
             verified=False,
         )
 
-    # --- Summarize top docs with OpenAI ---
+    # 2) build tight context
     context = "\n\n---\n\n".join(docs[:3])
     if len(context) > 1800:
         context = context[:1800]
 
-    summary_prompt = f"""
-You are a medical educator. Write a concise explanation in 2–3 lines (~60 words),
+    # 3) RELEVANCE GATE (YES/NO). If NO -> not covered.
+    try:
+        gate_prompt = f"""You are a careful evaluator.
+Question: {q}
+
+Context (from clinic materials):
+{context}
+
+Does the context directly answer the question in a way useful to a patient? Answer exactly YES or NO."""
+        gate = client.chat.completions.create(
+            model="gpt-4o-mini", temperature=0.0,
+            messages=[{"role":"user","content":gate_prompt}]
+        )
+        verdict = (gate.choices[0].message.content or "").strip().upper()
+    except Exception:
+        verdict = "YES"  # fail-open on transient errors
+
+    if verdict != "YES":
+        return AskResp(
+            answer=NO_MATCH,
+            practice_notes=None,
+            suggestions=[],
+            safety={"triage": None},
+            verified=False,
+        )
+
+    # 4) concise paraphrase from verified context (no external fallback)
+    summary_prompt = f"""You are a medical educator. Write a concise explanation in 2–3 lines (~60 words),
 based only on the context below. Slightly paraphrase for clarity.
 Do not diagnose, prescribe, or mention drug dosages.
 
 Context:
 {context}
 
-Question: {q}
-    """.strip()
-
+Question: {q}"""
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.4,
-            messages=[{"role": "user", "content": summary_prompt}],
+            model="gpt-4o-mini", temperature=0.4,
+            messages=[{"role":"user","content":summary_prompt}]
         )
         answer = (resp.choices[0].message.content or "").strip()
     except Exception:
-        # Fallback if LLM hiccups: just return a snippet
-        import re as _re
-        def _two_sents(t: str) -> str:
-            s = _re.split(r"(?<=[.!?])\s+", t.strip())
-            return " ".join(s[:2]).strip()
-        answer = _two_sents(docs[0])
+        answer = NO_MATCH
 
-    # --- Suggestions & safety (guarded) ---
+    # 5) safety + suggestions (guarded)
     try:
         safety = triage_flags(q + "\n" + answer) or {"triage": None}
     except Exception:
@@ -196,8 +207,9 @@ Question: {q}
         practice_notes=None,
         suggestions=suggestions,
         safety=safety,
-        verified=True,
+        verified=True if answer != NO_MATCH else False,
     )
+
 
 
 # ===== Widget JS (polish + spinner + pills; sans-serif + orange 4px button) =====
