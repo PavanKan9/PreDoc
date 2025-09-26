@@ -112,7 +112,7 @@ async def ask(req: AskReq):
     topic = (req.topic or "shoulder").lower()
 
     # --- Query Chroma ---
-    res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
+    res = COLL.query(query_texts=[q], n_results=5)
     docs = res.get("documents", [[]])[0]
 
     # Fallback: global search if no docs for topic
