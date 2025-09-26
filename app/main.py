@@ -21,36 +21,6 @@ ALLOW_ORIGINS = [o.strip() for o in os.environ.get("ALLOW_ORIGINS", "").split(",
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 INDEX_DIR = os.path.join(DATA_DIR, "chroma")
 
-# Retrieval strictness (lower = stricter)
-DISTANCE_THRESHOLD = float(os.environ.get("DISTANCE_THRESHOLD", "0.35"))
-
-# --- helpers for minimal behavior changes ---
-def _paraphrase_once(q: str) -> str:
-    """
-    Single-shot neutral paraphrase to improve recall only when the first retrieval is empty.
-    Preserves meaning; no new claims. Returns original on failure.
-    """
-    try:
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {"role": "system", "content": "Paraphrase the user's medical question in one sentence. Preserve meaning; don't add new claims."},
-                {"role": "user", "content": q},
-            ],
-        )
-        p = (r.choices[0].message.content or "").strip()
-        return p or q
-    except Exception:
-        return q
-
-def _looks_verified(dists) -> bool:
-    """Smaller distance is better. Verified if top distance < DISTANCE_THRESHOLD."""
-    try:
-        return bool(dists) and dists[0] is not None and float(dists[0]) < DISTANCE_THRESHOLD
-    except Exception:
-        return False
-
 # ===== App & middleware =====
 client = OpenAI()
 app = FastAPI()
@@ -134,7 +104,7 @@ async def ingest_file(file: UploadFile = File(...), topic: str = Form("shoulder"
         )
     return {"added": len(chunks)}
 
-# ===== Ask (concise paraphrase when grounded; otherwise “not covered”) =====
+# ===== Answering helpers =====
 NO_MATCH_MESSAGE = (
     "I couldn’t find this answered in the clinic’s provided materials. "
     "You can try rephrasing your question, or ask your clinician for guidance."
@@ -148,23 +118,12 @@ def clamp_to_3_sentences(text: str) -> str:
     if not text:
         return text
     sents = _SENT_SPLIT.split(text)
-    # remove empty fragments
     sents = [s.strip() for s in sents if s.strip()]
-    # keep max 3 sentences
     sents = sents[:3]
-    # if model gave just 1 long sentence, that's fine; otherwise join
     return " ".join(sents)
-
-def join_top_docs(doc_lists: List[str], max_chars: int = 1800) -> str:
-    """Join top doc chunks into a single snippet with a soft char cap."""
-    snippet = "\n\n---\n\n".join(doc_lists[:3])
-    return snippet[:max_chars]
-
-# ---------- Helpers (single-doc setup: global retrieval) ----------
 
 def _normalize(txt: str) -> str:
     """Trim, collapse whitespace, and strip obvious Q:/A: headers."""
-    import re
     if not isinstance(txt, str):
         return ""
     t = txt.strip()
@@ -173,108 +132,41 @@ def _normalize(txt: str) -> str:
     t = re.sub(r"\s+", " ", t)
     return t.strip()
 
-def filter_suggestions_in_doc(suggestions: List[str], limit: int = 4) -> List[str]:
-    """Keep only pills that the (global) retriever can actually answer."""
-    good: List[str] = []
-    for s in (suggestions or []):
-        try:
-            res = COLL.query(query_texts=[s], n_results=1)  # GLOBAL (no where)
-            docs = res.get("documents", [[]])[0]
-            if docs:
-                good.append(s)
-                if len(good) >= limit:
-                    break
-        except Exception:
-            pass
-    return good
-
-CURATED_DEFAULTS = [
-    "What is shoulder arthroscopy?",
-    "When is it recommended?",
-    "What are the risks?",
-    "How long is recovery?",
-]
-
-NO_MATCH_MESSAGE = (
-    "I couldn’t find this answered in the clinic’s provided materials. "
-    "You can try rephrasing your question, or ask your clinician directly."
-)
-
-# ----------------------------- /ask -----------------------------
-@app.post("/ask", response_model=AskResp)
-async def ask(req: AskReq):
-    q = (req.question or "").strip()
-    topic = (req.topic or "shoulder").lower()
-    max_k = req.max_suggestions if isinstance(req.max_suggestions, int) else 4
-
-    NO_MATCH_MESSAGE = (
-        "I couldn’t find this answered in the clinic’s provided materials. "
-        "You can try rephrasing your question, or ask your clinician directly."
-    )
-
-    # 1) Retrieval (global for single-doc setup)
+def _paraphrase_once(q: str) -> str:
+    """
+    Single-shot neutral paraphrase used only as a fallback.
+    Preserves meaning; no new claims. Returns original on failure.
+    """
     try:
-        res = COLL.query(query_texts=[q], n_results=5, include=["documents","distances"])
-        docs = res.get("documents", [[]])[0]
-        dists = res.get("distances", [[]])[0] or []
-    except Exception:
-        docs, dists = [], []
-
-    # If nothing retrieved (or only empty strings), paraphrase once and retry
-    if (not docs) or all((not (d or "").strip()) for d in docs):
-        q2 = _paraphrase_once(q)
-        if q2 and q2 != q:
-            try:
-                res = COLL.query(query_texts=[q2], n_results=5, include=["documents","distances"])
-                docs = res.get("documents", [[]])[0]
-                dists = res.get("distances", [[]])[0] or []
-            except Exception:
-                docs, dists = [], []
-
-    if not docs:
-        return AskResp(
-            answer=NO_MATCH_MESSAGE,
-            practice_notes=None,
-            suggestions=[
-                "What is shoulder arthroscopy?",
-                "When is it recommended?",
-                "What are the risks?",
-                "How long is recovery?",
-            ][:max_k],
-            safety={"triage": None},
-            verified=False,
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "Paraphrase the user's medical question in one sentence. Preserve meaning; don't add new claims."},
+                {"role": "user", "content": q},
+            ],
         )
+        p = (r.choices[0].message.content or "").strip()
+        return p or q
+    except Exception:
+        return q
 
-    # 2) Clean and join top chunks
-    def _normalize(txt: str) -> str:
-        import re
-        if not isinstance(txt, str):
-            return ""
-        t = txt.strip()
-        t = re.sub(r"(?:^|\n)(Q:|Question:).*?$", "", t, flags=re.IGNORECASE)
-        t = re.sub(r"(?:^|\n)(A:|Answer:).*?$", "", t, flags=re.IGNORECASE)
-        t = re.sub(r"\s+", " ", t)
-        return t.strip()
+def _retrieve(q: str, n: int = 5):
+    """Single-doc global retrieval."""
+    try:
+        res = COLL.query(query_texts=[q], n_results=n)
+        return res.get("documents", [[]])[0]
+    except Exception:
+        return []
 
+def _build_context(docs: List[str], max_chars: int = 1800) -> str:
     clean_docs = [_normalize(d) for d in docs[:3] if isinstance(d, str) and d.strip()]
     context = "\n\n---\n\n".join(clean_docs)
-    if not context:
-        return AskResp(
-            answer=NO_MATCH_MESSAGE,
-            practice_notes=None,
-            suggestions=[
-                "What is shoulder arthroscopy?",
-                "When is it recommended?",
-                "What are the risks?",
-                "How long is recovery?",
-            ][:max_k],
-            safety={"triage": None},
-            verified=False,
-        )
-    if len(context) > 1800:
-        context = context[:1800]
+    return context[:max_chars] if context else ""
 
-    # 3) Summarize strictly from clinic material
+def _summarize_from_context(q: str, context: str) -> str:
+    if not context:
+        return NO_MATCH_MESSAGE
     summary_messages = [
         {
             "role": "system",
@@ -289,26 +181,85 @@ async def ask(req: AskReq):
                 "You can try rephrasing your question, or ask your clinician directly."
             ),
         },
-        {
-            "role": "user",
-            "content": f"Question: {q}\n\nMaterial:\n{context}",
-        },
+        {"role": "user", "content": f"Question: {q}\n\nMaterial:\n{context}"},
     ]
-
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
             messages=summary_messages,
         )
-        answer = (resp.choices[0].message.content or "").strip()
+        return (resp.choices[0].message.content or "").strip()
     except Exception:
-        answer = NO_MATCH_MESSAGE
+        return NO_MATCH_MESSAGE
 
-    # Verified via top embedding distance; if not verified and not the standard not-found message, prefix explicitly.
-    verified = _looks_verified(dists)
-    if (not verified) and (answer.strip() != NO_MATCH_MESSAGE.strip()):
-        answer = "**Not found in your uploaded clinic material.** Here is general information:\n\n" + answer
+# ----------------------------- /ask -----------------------------
+@app.post("/ask", response_model=AskResp)
+async def ask(req: AskReq):
+    q = (req.question or "").strip()
+    topic = (req.topic or "shoulder").lower()
+    max_k = req.max_suggestions if isinstance(req.max_suggestions, int) else 4
+
+    NO_MATCH_MESSAGE_LOCAL = (
+        "I couldn’t find this answered in the clinic’s provided materials. "
+        "You can try rephrasing your question, or ask your clinician directly."
+    )
+
+    # 1) Retrieval
+    docs = _retrieve(q, n=5)
+
+    # If nothing retrieved (or only blanks), paraphrase once and retry retrieval
+    if (not docs) or all((not (d or "").strip()) for d in docs):
+        q2 = _paraphrase_once(q)
+        if q2 and q2 != q:
+            docs = _retrieve(q2, n=5)
+
+    # If still nothing, return explicit not-found
+    if not docs:
+        return AskResp(
+            answer=NO_MATCH_MESSAGE_LOCAL,
+            practice_notes=None,
+            suggestions=[
+                "What is shoulder arthroscopy?",
+                "When is it recommended?",
+                "What are the risks?",
+                "How long is recovery?",
+            ][:max_k],
+            safety={"triage": None},
+            verified=False,
+        )
+
+    # 2) Build context and summarize
+    context = _build_context(docs, max_chars=1800)
+    if not context:
+        return AskResp(
+            answer=NO_MATCH_MESSAGE_LOCAL,
+            practice_notes=None,
+            suggestions=[
+                "What is shoulder arthroscopy?",
+                "When is it recommended?",
+                "What are the risks?",
+                "How long is recovery?",
+            ][:max_k],
+            safety={"triage": None},
+            verified=False,
+        )
+
+    answer = _summarize_from_context(q, context)
+
+    # If the model says "not covered", do ONE more paraphrase-retrieve-summarize cycle
+    if answer.strip() == NO_MATCH_MESSAGE_LOCAL.strip():
+        q2 = _paraphrase_once(q)
+        if q2 and q2 != q:
+            docs2 = _retrieve(q2, n=5)
+            ctx2 = _build_context(docs2, max_chars=1800) if docs2 else ""
+            if ctx2:
+                answer2 = _summarize_from_context(q2, ctx2)
+                if answer2.strip():
+                    answer = answer2
+
+    # 3) Verified = not NO_MATCH_MESSAGE_LOCAL (simple and robust)
+    verified = (answer.strip() != NO_MATCH_MESSAGE_LOCAL.strip())
 
     # 4) Safety triage
     try:
@@ -316,7 +267,7 @@ async def ask(req: AskReq):
     except Exception:
         safety = {"triage": None}
 
-    # 5) Suggestions (generate, then filter shoulder-only)
+    # 5) Suggestions (generate, then filter shoulder-only — unchanged)
     try:
         suggestions = gen_suggestions(
             q, answer, topic=topic, k=max_k, avoid=req.avoid
@@ -599,6 +550,6 @@ def home():
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=16" defer></script>
+  <script src="/widget.js?v=17" defer></script>
 </body>
 </html>"""
