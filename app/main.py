@@ -177,19 +177,24 @@ NO_MATCH_MESSAGE = (
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
     q = (req.question or "").strip()
+    topic = (req.topic or "shoulder").lower()
     max_k = req.max_suggestions if isinstance(req.max_suggestions, int) else 4
 
-    # 1) GLOBAL retrieval (single-doc setup)
+    NO_MATCH_MESSAGE = (
+        "I couldn’t find this answered in the clinic’s provided materials. "
+        "You can try rephrasing your question, or ask your clinician directly."
+    )
+
+    # 1) Retrieval (global is fine since you have a single doc right now)
     try:
-        res = COLL.query(query_texts=[q], n_results=5)  # no topic filter
+        res = COLL.query(query_texts=[q], n_results=5)
         docs = res.get("documents", [[]])[0]
     except Exception:
         docs = []
 
     if not docs:
         return AskResp(
-            answer=("I couldn’t find this answered in the clinic’s provided materials. "
-                    "You can try rephrasing your question, or ask your clinician directly."),
+            answer=NO_MATCH_MESSAGE,
             practice_notes=None,
             suggestions=[
                 "What is shoulder arthroscopy?",
@@ -201,12 +206,13 @@ async def ask(req: AskReq):
             verified=False,
         )
 
-    # 2) Build clean, tight context (normalize + join)
+    # 2) Build a clean, tight context from top chunks
     def _normalize(txt: str) -> str:
         import re
         if not isinstance(txt, str):
             return ""
         t = txt.strip()
+        # Strip obvious Q:/A: headers and collapse whitespace
         t = re.sub(r"(?:^|\n)(Q:|Question:).*?$", "", t, flags=re.IGNORECASE)
         t = re.sub(r"(?:^|\n)(A:|Answer:).*?$", "", t, flags=re.IGNORECASE)
         t = re.sub(r"\s+", " ", t)
@@ -214,13 +220,9 @@ async def ask(req: AskReq):
 
     clean_docs = [_normalize(d) for d in docs[:3] if isinstance(d, str) and d.strip()]
     context = "\n\n---\n\n".join(clean_docs)
-    if len(context) > 1800:
-        context = context[:1800]
-
     if not context:
         return AskResp(
-            answer=("I couldn’t find this answered in the clinic’s provided materials. "
-                    "You can try rephrasing your question, or ask your clinician directly."),
+            answer=NO_MATCH_MESSAGE,
             practice_notes=None,
             suggestions=[
                 "What is shoulder arthroscopy?",
@@ -231,22 +233,27 @@ async def ask(req: AskReq):
             safety={"triage": None},
             verified=False,
         )
+    if len(context) > 1800:
+        context = context[:1800]
 
-    # 3) Concise paraphrase strictly from clinic context (no chit-chat)
+    # 3) Concise paraphrase STRICTLY from clinic material (no fallback to general knowledge)
     summary_messages = [
         {
             "role": "system",
             "content": (
-                "You are a medical educator. Answer ONLY from the provided clinic context. "
-                "Write 2–3 short sentences (45–80 words), clear and neutral. "
-                "No pleasantries, no first-person, no advice or dosing."
+                "You are a medical explainer. "
+                "Answer ONLY using the provided material. "
+                "Write 2–3 clear sentences (45–80 words), neutral tone. "
+                "Do not add pleasantries, introductions, or disclaimers. "
+                f"If the material does not answer the question, reply EXACTLY with: {NO_MATCH_MESSAGE}"
             ),
         },
         {
             "role": "user",
-            "content": f"Question: {q}\n\nClinic context:\n{context}",
+            "content": f"Question: {q}\n\nMaterial:\n{context}",
         },
     ]
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -255,19 +262,21 @@ async def ask(req: AskReq):
         )
         answer = (resp.choices[0].message.content or "").strip()
     except Exception:
-        answer = clean_docs[0][:300] if clean_docs else (
-            "I couldn’t generate a response just now."
-        )
+        answer = NO_MATCH_MESSAGE
 
-    # 4) Safety (guarded)
+    verified = (answer != NO_MATCH_MESSAGE)
+
+    # 4) Safety triage (guarded)
     try:
         safety = triage_flags(q + "\n" + answer) or {"triage": None}
     except Exception:
         safety = {"triage": None}
 
-    # 5) Suggestions (optional: keep as-is; pill filtering can be skipped for now)
+    # 5) Suggestions (keep your current flow; fall back if empty)
     try:
-        suggestions = gen_suggestions(q, answer, topic=(req.topic or "shoulder"), k=max_k, avoid=req.avoid) or []
+        suggestions = gen_suggestions(
+            q, answer, topic=topic, k=max_k, avoid=req.avoid
+        ) or []
     except Exception:
         suggestions = []
     if not suggestions:
@@ -283,9 +292,10 @@ async def ask(req: AskReq):
         practice_notes=None,
         suggestions=suggestions[:max_k],
         safety=safety,
-        verified=True,
+        verified=verified,
     )
 
+# ----------------------------- /peek -----------------------------
 
 @app.get("/peek")
 def peek(q: str, topic: str = "shoulder"):
@@ -524,6 +534,6 @@ def home():
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=13" defer></script>
+  <script src="/widget.js?v=14" defer></script>
 </body>
 </html>"""
