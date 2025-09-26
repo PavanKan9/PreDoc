@@ -185,7 +185,7 @@ async def ask(req: AskReq):
         "You can try rephrasing your question, or ask your clinician directly."
     )
 
-    # 1) Retrieval (global is fine since you have a single doc right now)
+    # 1) Retrieval (global for single-doc setup)
     try:
         res = COLL.query(query_texts=[q], n_results=5)
         docs = res.get("documents", [[]])[0]
@@ -200,19 +200,18 @@ async def ask(req: AskReq):
                 "What is shoulder arthroscopy?",
                 "When is it recommended?",
                 "What are the risks?",
-                "How long is recovery?"
+                "How long is recovery?",
             ][:max_k],
             safety={"triage": None},
             verified=False,
         )
 
-    # 2) Build a clean, tight context from top chunks
+    # 2) Clean and join top chunks
     def _normalize(txt: str) -> str:
         import re
         if not isinstance(txt, str):
             return ""
         t = txt.strip()
-        # Strip obvious Q:/A: headers and collapse whitespace
         t = re.sub(r"(?:^|\n)(Q:|Question:).*?$", "", t, flags=re.IGNORECASE)
         t = re.sub(r"(?:^|\n)(A:|Answer:).*?$", "", t, flags=re.IGNORECASE)
         t = re.sub(r"\s+", " ", t)
@@ -228,7 +227,7 @@ async def ask(req: AskReq):
                 "What is shoulder arthroscopy?",
                 "When is it recommended?",
                 "What are the risks?",
-                "How long is recovery?"
+                "How long is recovery?",
             ][:max_k],
             safety={"triage": None},
             verified=False,
@@ -236,24 +235,26 @@ async def ask(req: AskReq):
     if len(context) > 1800:
         context = context[:1800]
 
-    # 3) Concise paraphrase STRICTLY from clinic material (no fallback to general knowledge)
-   summary_messages = [
-    {
-        "role": "system",
-        "content": (
-            "You are a medical explainer. "
-            "Write 2–3 clear sentences (45–80 words) using only the provided material. "
-            "Start directly with the answer; do not refer to documents, material, context, sources, or clinics. "
-            "Do not add pleasantries, introductions, or disclaimers. "
-            "Use the document’s terminology when naming conditions or procedures. "
-            f"If the material does not answer the question, reply EXACTLY with: {NO_MATCH_MESSAGE}"
-        ),
-    },
-    {
-        "role": "user",
-        "content": f"Question: {q}\n\nMaterial:\n{context}",
-    },
-]
+    # 3) Summarize strictly from clinic material
+    summary_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a medical explainer. "
+                "Write 2–3 clear sentences (45–80 words) using only the provided material. "
+                "Start directly with the answer; do not refer to documents, material, context, sources, or clinics. "
+                "Do not add pleasantries, introductions, or disclaimers. "
+                "Use the document’s terminology when naming conditions or procedures. "
+                "If the material does not answer the question, reply EXACTLY with: "
+                "I couldn’t find this answered in the clinic’s provided materials. "
+                "You can try rephrasing your question, or ask your clinician directly."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Question: {q}\n\nMaterial:\n{context}",
+        },
+    ]
 
     try:
         resp = client.chat.completions.create(
@@ -267,13 +268,13 @@ async def ask(req: AskReq):
 
     verified = (answer != NO_MATCH_MESSAGE)
 
-    # 4) Safety triage (guarded)
+    # 4) Safety triage
     try:
         safety = triage_flags(q + "\n" + answer) or {"triage": None}
     except Exception:
         safety = {"triage": None}
 
-   # 5) Suggestions (generate, then filter to shoulder-only)
+    # 5) Suggestions (generate, then filter shoulder-only)
     try:
         suggestions = gen_suggestions(
             q, answer, topic=topic, k=max_k, avoid=req.avoid
@@ -281,14 +282,12 @@ async def ask(req: AskReq):
     except Exception:
         suggestions = []
 
-    # --- Shoulder-only pill filter ---
     SHOULDER_DEFAULTS = [
         "What is shoulder arthroscopy?",
         "When is it recommended?",
         "What are the risks?",
         "How long is recovery?",
     ]
-
     OFF_TOPIC_TERMS = {"knee", "hip", "spine", "ankle", "wrist", "elbow", "back", "neck"}
 
     def _shoulder_only(sugs, limit):
@@ -317,6 +316,7 @@ async def ask(req: AskReq):
         safety=safety,
         verified=verified,
     )
+
 
 # ----------------------------- /peek -----------------------------
 
@@ -557,6 +557,6 @@ def home():
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=15" defer></script>
+  <script src="/widget.js?v=16" defer></script>
 </body>
 </html>"""
