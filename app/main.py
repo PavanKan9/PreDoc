@@ -247,6 +247,20 @@ async def ask(req: AskReq):
         safety=safety,
         verified=True,
     )
+@app.get("/peek")
+def peek(q: str, topic: str = "shoulder"):
+    try:
+        scoped = COLL.query(query_texts=[q], n_results=3, where={"topic": topic})
+        global_q = COLL.query(query_texts=[q], n_results=3)
+        return {
+            "scoped_docs": scoped.get("documents", [[]])[0],
+            "scoped_metas": scoped.get("metadatas", [[]])[0],
+            "global_docs": global_q.get("documents", [[]])[0],
+            "global_metas": global_q.get("metadatas", [[]])[0],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 
 # ===== Widget JS (unchanged from your version) =====
 @app.get("/widget.js", response_class=PlainTextResponse)
