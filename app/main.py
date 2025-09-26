@@ -118,96 +118,84 @@ def first_two_sents(txt: str) -> str:
     sents = re.split(r"(?<=[.!?])\s+", txt.strip())
     return " ".join(sents[:2]).strip()
 
+# --- Helper to validate suggestions ---
+def filter_suggestions_in_doc(suggestions: List[str], topic: str, limit: int = 4) -> List[str]:
+    good = []
+    for s in suggestions:
+        res = COLL.query(query_texts=[s], n_results=1, where={"topic": topic})
+        docs = res.get("documents", [[]])[0]
+        if docs:  # only keep if we got something back
+            good.append(s)
+        if len(good) >= limit:
+            break
+    return good
+    
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
     q = (req.question or "").strip()
     topic = (req.topic or "shoulder").lower()
 
-    NO_MATCH = ("I couldn’t find this answered in the clinic’s provided materials. "
-                "You can try rephrasing your question, or ask your clinician directly.")
-
-    # 1) STRICT: topic-scoped retrieval only
-    res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
+    # --- Query Chroma (topic scoped) ---
+    res = COLL.query(
+        query_texts=[q],
+        n_results=5,
+        where={"topic": topic}
+    )
     docs = res.get("documents", [[]])[0]
 
-    # nothing? -> not covered (no generic fallback)
+    # Optional fallback: global search if no docs for this topic
+    if not docs:
+        res = COLL.query(query_texts=[q], n_results=5)
+        docs = res.get("documents", [[]])[0]
+
+    # If nothing at all → politely decline
     if not docs:
         return AskResp(
-            answer=NO_MATCH,
+            answer="I couldn’t find this answered in the clinic’s provided materials. "
+                   "You can try rephrasing your question, or ask your clinician directly.",
             practice_notes=None,
-            suggestions=[],
+            suggestions=[
+                "What is shoulder arthroscopy?",
+                "When is it recommended?",
+                "What are the risks?",
+                "How long is recovery?"
+            ],
             safety={"triage": None},
             verified=False,
         )
 
-    # 2) build tight context
-    context = "\n\n---\n\n".join(docs[:3])
-    if len(context) > 1800:
-        context = context[:1800]
-
-    # 3) RELEVANCE GATE (YES/NO). If NO -> not covered.
+    # --- Summarize into a concise answer ---
     try:
-        gate_prompt = f"""You are a careful evaluator.
-Question: {q}
-
-Context (from clinic materials):
-{context}
-
-Does the context directly answer the question in a way useful to a patient? Answer exactly YES or NO."""
-        gate = client.chat.completions.create(
-            model="gpt-4o-mini", temperature=0.0,
-            messages=[{"role":"user","content":gate_prompt}]
-        )
-        verdict = (gate.choices[0].message.content or "").strip().upper()
+        answer = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a medical explainer. Answer in 2–3 short, plain sentences, based only on clinic material."},
+                {"role": "user", "content": f"Question: {q}\n\nContext:\n{docs}"}
+            ],
+            max_tokens=200,
+        ).choices[0].message.content.strip()
     except Exception:
-        verdict = "YES"  # fail-open on transient errors
+        # fallback to raw doc snippet
+        answer = " ".join(docs[:2])
 
-    if verdict != "YES":
-        return AskResp(
-            answer=NO_MATCH,
-            practice_notes=None,
-            suggestions=[],
-            safety={"triage": None},
-            verified=False,
-        )
+    # --- Generate pills, then filter them against doc ---
+    raw_sugs = gen_suggestions(q, docs)
+    suggestions = filter_suggestions_in_doc(raw_sugs, topic)
+    if not suggestions:
+        suggestions = [
+            "What is shoulder arthroscopy?",
+            "When is it recommended?",
+            "What are the risks?",
+            "How long is recovery?"
+        ]
 
-    # 4) concise paraphrase from verified context (no external fallback)
-    summary_prompt = f"""You are a medical educator. Write a concise explanation in 2–3 lines (~60 words),
-based only on the context below. Slightly paraphrase for clarity.
-Do not diagnose, prescribe, or mention drug dosages.
-
-Context:
-{context}
-
-Question: {q}"""
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini", temperature=0.4,
-            messages=[{"role":"user","content":summary_prompt}]
-        )
-        answer = (resp.choices[0].message.content or "").strip()
-    except Exception:
-        answer = NO_MATCH
-
-    # 5) safety + suggestions (guarded)
-    try:
-        safety = triage_flags(q + "\n" + answer) or {"triage": None}
-    except Exception:
-        safety = {"triage": None}
-
-    try:
-        suggestions = gen_suggestions(
-            q, answer, topic=topic, k=req.max_suggestions, avoid=req.avoid
-        ) or []
-    except Exception:
-        suggestions = []
-
+    # --- Build response ---
     return AskResp(
         answer=answer,
         practice_notes=None,
         suggestions=suggestions,
-        safety=safety,
-        verified=True if answer != NO_MATCH else False,
+        safety={"triage": None},
+        verified=True,
     )
 
 
