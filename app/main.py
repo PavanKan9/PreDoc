@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional
-import os
+import os, re
 
 from openai import OpenAI
 import chromadb
@@ -20,6 +20,9 @@ assert OPENAI_API_KEY, "OPENAI_API_KEY is required"
 ALLOW_ORIGINS = [o.strip() for o in os.environ.get("ALLOW_ORIGINS", "").split(",") if o.strip()] or ["*"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 INDEX_DIR = os.path.join(DATA_DIR, "chroma")
+
+# Retrieval strictness (lower = stricter)
+DISTANCE_THRESHOLD = float(os.environ.get("DISTANCE_THRESHOLD", "0.35"))
 
 # ===== App & middleware =====
 client = OpenAI()
@@ -53,7 +56,7 @@ class AskResp(BaseModel):
     practice_notes: Optional[str] = None
     suggestions: List[str]
     safety: dict
-    verified: bool  # True = grounded in uploaded docs; False = external fallback
+    verified: bool  # True = grounded in uploaded docs; False = not covered
     disclaimer: str = "Educational information only — not medical advice."
 
 # ===== Utility / debug =====
@@ -93,44 +96,65 @@ async def ingest_file(file: UploadFile = File(...), topic: str = Form("shoulder"
         )
     return {"added": len(chunks)}
 
-# ===== Ask (concise paraphrase; verified vs. fallback; dynamic pills) =====
+# ===== Ask (concise paraphrase when grounded; otherwise “not covered”) =====
+NO_MATCH_MESSAGE = (
+    "I couldn’t find this answered in the clinic’s provided materials. "
+    "You can try rephrasing your question, or ask your clinician for guidance."
+)
+
+def first_two_sents(txt: str) -> str:
+    sents = re.split(r"(?<=[.!?])\s+", txt.strip())
+    return " ".join(sents[:2]).strip()
+
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
     """
-    Returns a concise 2–3 line answer (slight paraphrase) grounded in retrieved passages.
-    If no relevant doc context exists, falls back to external general knowledge and marks as not verified.
-    Pills adapt to the last Q+A; urgent care pill is prepended if flagged.
+    - If retrieval yields relevant passages (distance <= threshold): concise 2–3 line paraphrase (verified=True).
+    - If not: politely say it's not covered in clinic materials (no general fallback; verified=False).
+    - Suggestions still adapt; urgent-care pill still prepends on flags.
     """
     q = req.question.strip()
     topic = (req.topic or "shoulder").lower()
 
-    # 1) Retrieve context (try with topic, then without)
-    res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
+    # 1) Retrieve with distances (topic first, then fallback to no topic)
+    res = COLL.query(
+        query_texts=[q],
+        n_results=5,
+        where={"topic": topic},
+        include_distances=True
+    )
     docs = res.get("documents", [[]])[0]
+    dists = res.get("distances", [[]])[0]
+
     if not docs:
-        res = COLL.query(query_texts=[q], n_results=5)
+        res = COLL.query(query_texts=[q], n_results=5, include_distances=True)
         docs = res.get("documents", [[]])[0]
+        dists = res.get("distances", [[]])[0]
 
-    # Limit context size to keep prompts focused
-    context = "\n\n---\n\n".join(docs[:3]) if docs else ""
-    if len(context) > 1800:
-        context = context[:1800]
+    # 2) Decide if doc-based answer is strong enough
+    has_match = bool(docs) and any(d <= DISTANCE_THRESHOLD for d in (dists or []))
 
-    answer = ""
-    verified = False
+    if has_match:
+        # Build focused context from best matches within threshold
+        paired = [(d, t) for d, t in zip(dists, docs)]
+        paired.sort(key=lambda x: x[0])
+        top = [t for d, t in paired if d <= DISTANCE_THRESHOLD][:3]
+        context = "\n\n---\n\n".join(top)
+        if len(context) > 1800:
+            context = context[:1800]
 
-    # 2) If we have context -> summarize from doc (verified=True)
-    if context:
+        # Paraphrase concisely from clinic docs (verified=True)
         summary_prompt = f"""
-You are a medical educator. Write a concise explanation in 2–3 lines (max ~60 words),
-based only on the context below. Slightly paraphrase so it is clear and easy to read.
-Do not include unrelated details, do not give medical advice, and do not mention drugs or dosages.
+You are a medical educator. Write a concise explanation in 2–3 lines (~60 words),
+based only on the context below. Slightly paraphrase for clarity.
+Do not diagnose, prescribe, or mention drug dosages.
 
 Context:
 {context}
 
 Question: {q}
         """.strip()
+
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -143,64 +167,42 @@ Question: {q}
             answer = candidate
             verified = True
         except Exception:
-            answer = ""
+            # Fallback: short verbatim snippets if LLM fails unexpectedly
+            snippets = [first_two_sents(t) for t in top]
+            answer = " ".join(s for s in snippets if s) or NO_MATCH_MESSAGE
+            verified = True
+    else:
+        # Not covered in docs — do NOT generate general content
+        answer = NO_MATCH_MESSAGE
+        verified = False
 
-    # 3) External fallback (not verified by clinic)
-    if not answer:
-        ext_prompt = f"""
-Patient question: {q}
-
-Write a concise, neutral 2–3 line patient-education explanation (~60 words).
-Keep it general and safe; no diagnosis, prescriptions, or dosages.
-If symptoms sound urgent, suggest seeking urgent care.
-Return only the explanation text.
-        """.strip()
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                temperature=0.5,
-                messages=[{"role": "user", "content": ext_prompt}],
-            )
-            candidate = resp.choices[0].message.content.strip()
-            if len(candidate) > 420:
-                candidate = candidate[:420].rstrip()
-            answer = (
-                f"{candidate}\n\n"
-                "Note: This section is general educational content that has not been verified by your clinic. "
-                "Please contact your clinician for clarification."
-            )
-            verified = False
-        except Exception:
-            answer = "Sorry — I couldn’t find relevant information in the documents or generate a safe general explanation."
-            verified = False
-
-    # 4) Safety triage
+    # 3) Safety triage
     safety = triage_flags(q + "\n" + (answer or ""))
 
-    # 5) Suggestions (model-driven with avoidance list; fallback handled in sugg.py)
+    # 4) Suggestions (model-driven with avoidance list; fallbacks handled in sugg.py)
     suggestions = gen_suggestions(
         q, answer, topic=topic or "shoulder", k=req.max_suggestions, avoid=req.avoid
     )
 
-    # 6) Urgent pill on top if flagged
+    # 5) Urgent pill on top if flagged
     urgent = {
         "urgent_care": "Seek urgent care — learn more",
         "er": "Call emergency services — what to do now",
     }
-    if safety["triage"] in urgent:
+    if safety.get("triage") in urgent:
         label = urgent[safety["triage"]]
         suggestions = [label] + [s for s in suggestions if s != label]
         suggestions = suggestions[: req.max_suggestions]
 
     return AskResp(
         answer=answer,
-        practice_notes=None,  # keep field but unused
+        practice_notes=None,
         suggestions=suggestions,
         safety=safety,
         verified=verified,
     )
 
-# ===== Widget JS (Apple-like polish + spinner + question pills) =====
+# ===== Widget JS (polish + spinner + pills; sans-serif + orange 4px button) =====
 @app.get("/widget.js", response_class=PlainTextResponse)
 def widget_js():
     return """
@@ -224,9 +226,8 @@ def widget_js():
       --pill-border: #e5e7eb;
       --user: #e8eefc;
       --bot: #f6f7f8;
-      --accent: #111827;
+      --accent: #ff9900; /* Amazon orange */
       --shadow: 0 10px 30px rgba(0,0,0,0.08);
-      --radius: 14px;
     }
     @media (prefers-color-scheme: dark) {
       :root {
@@ -239,20 +240,25 @@ def widget_js():
         --pill-border: #24262b;
         --user: #12233f;
         --bot: #151617;
-        --accent: #e5e7eb;
         --shadow: 0 8px 28px rgba(0,0,0,0.45);
       }
     }
-    body, .drqa-card, .drqa-bubble, .drqa-pill, .drqa-input, .drqa-btn, .drqa-title {
-    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif }
-    body{ background: var(--bg); }
+
+    body { background: var(--bg); }
+
+    /* Force clean sans-serif everywhere */
+    body, .drqa-card, .drqa-bubble, .drqa-pill, .drqa-input, .drqa-title, .drqa-send {
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+                   "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
     .drqa-wrap{ max-width: 760px; margin: 0 auto; padding: 32px 20px 56px; }
-    .drqa-card{ background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+    .drqa-card{ background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
     .drqa-head{ padding: 18px 22px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
     .drqa-title{ font-size: 18px; font-weight: 600; letter-spacing: .2px; }
     .drqa-topic{ font-size: 13px; color: var(--muted); border:1px solid var(--border); padding: 6px 10px; border-radius: 999px; background: var(--pill); }
     .drqa-body{ padding: 10px 22px 18px; }
-    .drqa-messages{ display:flex; flex-direction:column; gap:12px; padding: 16px 0; min-height: 200px; }
+    .drqa-messages{ display:flex; flex-direction:column; gap:12px; padding: 16px 0; min-height: 200px; max-height: 58vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
     .drqa-bubble{ max-width: 85%; padding: 11px 13px; line-height: 1.45; border-radius: 14px; white-space: pre-wrap; border: 1px solid var(--border); opacity: 0; transform: translateY(4px); animation: drqa-in .18s ease forwards; }
     .drqa-bubble.user{ align-self:flex-end; background: var(--user); }
     .drqa-bubble.bot{ align-self:flex-start; background: var(--bot); }
@@ -266,24 +272,45 @@ def widget_js():
     .drqa-form{ display:flex; gap:10px; align-items:center; padding-top: 8px; border-top: 1px solid var(--border); margin-top: 8px; }
     .drqa-input{ flex:1; padding: 12px 14px; border:1px solid var(--border); border-radius: 12px; background: transparent; color: var(--text); outline: none; transition: border-color .15s ease, box-shadow .15s ease; font-size: 15px; }
     .drqa-input:focus{ border-color: #9ca3af; box-shadow: 0 0 0 3px rgba(156,163,175,0.2); }
-    .drqa-btn {
-      padding: 11px 16px;
-      border: 0;
-      border-radius: 12px;
-      background: #ff9900;   /* Amazon orange */
-      color: #111;           /* dark text for contrast */
-      cursor: pointer;
-      font-weight: 600;
-      transition: opacity .15s ease, transform .15s ease;
-      }
-     .drqa-btn:hover { opacity:.92; transform: translateY(-1px); }
-     .drqa-btn:active{ transform: translateY(0); }.drqa-btn:hover{ opacity:.92; transform: translateY(-1px); }
-     .drqa-foot{ padding: 10px 22px 16px; color: var(--muted); font-size: 12px; }
 
-    /* Spinner */
-    .drqa-spinner { width: 22px; height: 22px; border-radius: 50%; border: 3px solid rgba(0,0,0,0.12); border-top-color: rgba(0,0,0,0.55); animation: drqa-spin 0.8s linear infinite; display: none; }
-    @media (prefers-color-scheme: dark){ .drqa-spinner{ border-color: rgba(255,255,255,0.12); border-top-color: rgba(255,255,255,0.6); } }
+    /* Circular send button with up arrow; doubles as spinner */
+    .drqa-send{
+      width: 40px; height: 40px;
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 0; border-radius: 9999px;
+      background: var(--accent); color: #111;
+      cursor: pointer; font-weight: 700;
+      transition: transform .15s ease, opacity .15s ease;
+      position: relative; flex: 0 0 auto;
+    }
+    .drqa-send:hover{ transform: translateY(-1px); }
+    .drqa-send:active{ transform: translateY(0); }
+    .drqa-send:disabled{ opacity: .6; cursor: not-allowed; }
+
+    .drqa-send__icon{
+      font-size: 18px; line-height: 1;
+      transform: translateY(-1px); /* visually center ↑ */
+      display: block;
+    }
+
+    /* Spinner inside the button */
+    .drqa-send__spinner{
+      position: absolute; inset: 0;
+      margin: auto; width: 20px; height: 20px;
+      border-radius: 50%;
+      border: 3px solid rgba(0,0,0,0.15);
+      border-top-color: rgba(0,0,0,0.55);
+      animation: drqa-spin .8s linear infinite;
+      display: none;
+    }
+    @media (prefers-color-scheme: dark){
+      .drqa-send__spinner{ border-color: rgba(255,255,255,0.18); border-top-color: rgba(255,255,255,0.7); }
+    }
+    .drqa-send.is-loading .drqa-send__icon{ display: none; }
+    .drqa-send.is-loading .drqa-send__spinner{ display: block; }
     @keyframes drqa-spin { to { transform: rotate(360deg); } }
+
+    .drqa-foot{ padding: 10px 22px 16px; color: var(--muted); font-size: 12px; }
   </style>
 
   <div class="drqa-wrap">
@@ -299,8 +326,10 @@ def widget_js():
 
         <form id="drqa-form" class="drqa-form">
           <input id="drqa-input" class="drqa-input" type="text" placeholder="Ask about your shoulder…" autocomplete="off">
-          <div id="drqa-spinner" class="drqa-spinner" aria-label="thinking"></div>
-          <button type="submit" class="drqa-btn">Ask</button>
+          <button id="drqa-send" class="drqa-send" type="submit" aria-label="Send">
+            <span class="drqa-send__icon">↑</span>
+            <span class="drqa-send__spinner" aria-hidden="true"></span>
+          </button>
         </form>
       </div>
 
@@ -314,11 +343,11 @@ def widget_js():
   var topicEl = root.querySelector("#drqa-topic-text");
   topicEl.textContent = (TOPIC.charAt(0).toUpperCase() + TOPIC.slice(1));
 
-  var msgs = root.querySelector("#drqa-messages");
-  var pills = root.querySelector("#drqa-pills");
-  var form = root.querySelector("#drqa-form");
-  var input = root.querySelector("#drqa-input");
-  var spinner = root.querySelector("#drqa-spinner");
+  var msgs   = root.querySelector("#drqa-messages");
+  var pills  = root.querySelector("#drqa-pills");
+  var form   = root.querySelector("#drqa-form");
+  var input  = root.querySelector("#drqa-input");
+  var send   = root.querySelector("#drqa-send");
 
   function addMsg(text, who){
     var d = document.createElement("div");
@@ -328,7 +357,6 @@ def widget_js():
   }
 
   var lastSuggestions = [];
-
   function renderPills(arr){
     lastSuggestions = Array.isArray(arr) ? arr.slice(0) : [];
     pills.innerHTML = "";
@@ -336,20 +364,30 @@ def widget_js():
       var b = document.createElement("button");
       b.type = "button";
       b.className = "drqa-pill";
-      b.textContent = label.endsWith("?") ? label : (label + "?"); // ensure questions
-      b.onclick = function(){
-        input.value = b.textContent;
-        form.dispatchEvent(new Event("submit",{cancelable:true}));
-      };
+      b.textContent = label.endsWith("?") ? label : (label + "?");
+      b.onclick = function(){ input.value = b.textContent; form.dispatchEvent(new Event("submit",{cancelable:true})); };
       pills.appendChild(b);
     });
   }
 
-  function showSpinner(show){ spinner.style.display = show ? "inline-block" : "none"; }
+  function setLoading(loading){
+    if(loading){
+      send.classList.add("is-loading");
+      send.setAttribute("aria-busy","true");
+      send.disabled = true;
+      input.disabled = true;
+    }else{
+      send.classList.remove("is-loading");
+      send.removeAttribute("aria-busy");
+      send.disabled = false;
+      input.disabled = false;
+      input.focus();
+    }
+  }
 
   async function ask(q){
     addMsg(q, "user"); input.value="";
-    showSpinner(true);
+    setLoading(true);
     try{
       const body = { question: q, topic: TOPIC, avoid: lastSuggestions };
       var res = await fetch(API + "/ask", {
@@ -358,13 +396,12 @@ def widget_js():
         body: JSON.stringify(body)
       });
       var data = await res.json();
-      addMsg(data.answer, "bot");
-      if (data.practice_notes) addMsg(data.practice_notes, "bot");
+      addMsg(data.answer || "No answer available.", "bot");
       renderPills(data.suggestions || []);
     }catch(e){
       addMsg("Sorry — something went wrong. Please try again.", "bot");
     } finally {
-      showSpinner(false);
+      setLoading(false);
     }
   }
 
@@ -381,9 +418,13 @@ def widget_js():
     var q = input.value.trim();
     if(q) ask(q);
   });
+
+  // Enter key in input submits (already handled by form submit on Enter)
 })();
 """.strip()
 
+
+# ===== Minimal home (let the widget own the UI) =====
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """<!doctype html>
@@ -397,12 +438,9 @@ def home():
 <body>
   <div id="drqa-root"></div>
   <script>
-    // point to your API & default topic; tweak anytime
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=9" defer></script>
+  <script src="/widget.js?v=10" defer></script>
 </body>
 </html>"""
-
-
