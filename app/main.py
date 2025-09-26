@@ -256,7 +256,7 @@ async def ask(req: AskReq):
         )
 
     # 2) Build context and summarize
-    context = _build_context(docs, max_chars=1800)
+   context = _build_context(docs, max_chars=1800)
     if not context:
         return AskResp(
             answer=NO_MATCH_MESSAGE_LOCAL,
@@ -270,24 +270,26 @@ async def ask(req: AskReq):
             safety={"triage": None},
             verified=False,
         )
-# Cross-topic guard
-parts_in_q = _mentioned_parts(q)
-if parts_in_q and (topic not in parts_in_q):
-    ctx_low = context.lower()
-    if not any(any(tok in ctx_low for tok in _BODY_PARTS[p]) for p in parts_in_q):
-        return AskResp(
-            answer=NO_MATCH_MESSAGE_LOCAL,
-            practice_notes=None,
-            suggestions=[
-                "What is shoulder arthroscopy?",
-                "When is it recommended?",
-                "What are the risks?",
-                "How long is recovery?",
-            ][:max_k],
-            safety={"triage": None},
-            verified=False,
-        )
 
+    # ✅ Cross-topic guard goes here, same indent as above
+    parts_in_q = _mentioned_parts(q)
+    if parts_in_q and (topic not in parts_in_q):
+        ctx_low = context.lower()
+        if not any(any(tok in ctx_low for tok in _BODY_PARTS[p]) for p in parts_in_q):
+            return AskResp(
+                answer=NO_MATCH_MESSAGE_LOCAL,
+                practice_notes=None,
+                suggestions=[
+                    "What is shoulder arthroscopy?",
+                    "When is it recommended?",
+                    "What are the risks?",
+                    "How long is recovery?",
+                ][:max_k],
+                safety={"triage": None},
+                verified=False,
+            )
+
+    # Only if we pass the guard, we summarize
     answer = _summarize_from_context(q, context)
 
     # If the model says "not covered", do ONE more paraphrase-retrieve-summarize cycle
