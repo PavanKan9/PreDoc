@@ -151,13 +151,17 @@ def _paraphrase_once(q: str) -> str:
     except Exception:
         return q
 
-def _retrieve(q: str, n: int = 5):
-    """Single-doc global retrieval."""
+def _retrieve(q: str, n: int = 5, topic: Optional[str] = None):
+    """Single-doc retrieval, optionally scoped by topic metadata."""
     try:
-        res = COLL.query(query_texts=[q], n_results=n)
+        kwargs = {"query_texts": [q], "n_results": n}
+        if topic:
+            kwargs["where"] = {"topic": topic}
+        res = COLL.query(**kwargs)
         return res.get("documents", [[]])[0]
     except Exception:
         return []
+
 
 def _build_context(docs: List[str], max_chars: int = 1800) -> str:
     clean_docs = [_normalize(d) for d in docs[:3] if isinstance(d, str) and d.strip()]
@@ -193,6 +197,28 @@ def _summarize_from_context(q: str, context: str) -> str:
     except Exception:
         return NO_MATCH_MESSAGE
 
+_BODY_PARTS = {
+    "shoulder": {"shoulder"},
+    "knee": {"knee"},
+    "hip": {"hip"},
+    "elbow": {"elbow"},
+    "wrist": {"wrist"},
+    "ankle": {"ankle"},
+    "spine": {"spine", "back"},
+    "neck": {"neck", "cervical"},
+    "hand": {"hand", "hands"},
+    "foot": {"foot", "feet"},
+}
+
+def _mentioned_parts(text: str) -> set:
+    low = (text or "").lower()
+    found = set()
+    for part, tokens in _BODY_PARTS.items():
+        if any(t in low for t in tokens):
+            found.add(part)
+    return found
+    
+
 # ----------------------------- /ask -----------------------------
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
@@ -206,13 +232,13 @@ async def ask(req: AskReq):
     )
 
     # 1) Retrieval
-    docs = _retrieve(q, n=5)
+    docs = _retrieve(q, n=5, topic=topic)
 
     # If nothing retrieved (or only blanks), paraphrase once and retry retrieval
     if (not docs) or all((not (d or "").strip()) for d in docs):
         q2 = _paraphrase_once(q)
         if q2 and q2 != q:
-            docs = _retrieve(q2, n=5)
+            docs = _retrieve(q2, n=5, topic=topic)
 
     # If still nothing, return explicit not-found
     if not docs:
@@ -244,6 +270,23 @@ async def ask(req: AskReq):
             safety={"triage": None},
             verified=False,
         )
+# Cross-topic guard
+parts_in_q = _mentioned_parts(q)
+if parts_in_q and (topic not in parts_in_q):
+    ctx_low = context.lower()
+    if not any(any(tok in ctx_low for tok in _BODY_PARTS[p]) for p in parts_in_q):
+        return AskResp(
+            answer=NO_MATCH_MESSAGE_LOCAL,
+            practice_notes=None,
+            suggestions=[
+                "What is shoulder arthroscopy?",
+                "When is it recommended?",
+                "What are the risks?",
+                "How long is recovery?",
+            ][:max_k],
+            safety={"triage": None},
+            verified=False,
+        )
 
     answer = _summarize_from_context(q, context)
 
@@ -251,7 +294,7 @@ async def ask(req: AskReq):
     if answer.strip() == NO_MATCH_MESSAGE_LOCAL.strip():
         q2 = _paraphrase_once(q)
         if q2 and q2 != q:
-            docs2 = _retrieve(q2, n=5)
+            docs2 = _retrieve(q2, n=5, topic=topic)
             ctx2 = _build_context(docs2, max_chars=1800) if docs2 else ""
             if ctx2:
                 answer2 = _summarize_from_context(q2, ctx2)
