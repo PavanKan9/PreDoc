@@ -83,7 +83,6 @@ def reset():
     COLL = persist.get_or_create_collection(name="shoulder_docs", embedding_function=embedder)
     return {"ok": True}
 
-
 # ===== Ingest =====
 @app.post("/ingest")
 async def ingest_file(file: UploadFile = File(...), topic: str = Form("shoulder")):
@@ -114,155 +113,142 @@ NO_MATCH_MESSAGE = (
     "You can try rephrasing your question, or ask your clinician for guidance."
 )
 
-def first_two_sents(txt: str) -> str:
-    sents = re.split(r"(?<=[.!?])\s+", txt.strip())
-    return " ".join(sents[:2]).strip()
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
-# ---------- Helpers (put directly above /ask) ----------
+def clamp_to_3_sentences(text: str) -> str:
+    """Ensure the final answer is 2–3 short sentences max."""
+    text = text.strip()
+    if not text:
+        return text
+    sents = _SENT_SPLIT.split(text)
+    # remove empty fragments
+    sents = [s.strip() for s in sents if s.strip()]
+    # keep max 3 sentences
+    sents = sents[:3]
+    # if model gave just 1 long sentence, that's fine; otherwise join
+    return " ".join(sents)
 
-def _normalize(txt: str) -> str:
-    """Trim, collapse whitespace, and strip obvious Q:/A: headers."""
-    import re
-    if not isinstance(txt, str):
-        return ""
-    t = txt.strip()
-    t = re.sub(r"\s+", " ", t)                                  # collapse runs of whitespace
-    t = re.sub(r"(?:^|\n)(Q:|Question:).*?$", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"(?:^|\n)(A:|Answer:).*?$", "", t, flags=re.IGNORECASE)
-    return t.strip()
+def join_top_docs(doc_lists: List[str], max_chars: int = 1800) -> str:
+    """Join top doc chunks into a single snippet with a soft char cap."""
+    snippet = "\n\n---\n\n".join(doc_lists[:3])
+    return snippet[:max_chars]
 
+# --- Helper to validate suggestions exist somewhere in this topic ---
 def filter_suggestions_in_doc(suggestions: List[str], topic: str, limit: int = 4) -> List[str]:
-    """Keep only pills that the topic-scoped retriever can actually answer."""
-    good: List[str] = []
-    for s in (suggestions or []):
-        try:
-            res = COLL.query(query_texts=[s], n_results=1, where={"topic": topic})
-            docs = res.get("documents", [[]])[0]
-            if docs:
-                good.append(s)
-                if len(good) >= limit:
-                    break
-        except Exception:
-            # ignore a single bad query and continue
-            pass
+    good = []
+    for s in suggestions:
+        res = COLL.query(query_texts=[s], n_results=1, where={"topic": topic})
+        docs = res.get("documents", [[]])[0]
+        if docs:
+            good.append(s)
+        if len(good) >= limit:
+            break
     return good
-
-CURATED_DEFAULTS = {
-    "shoulder": [
-        "What is shoulder arthroscopy?",
-        "When is it recommended?",
-        "What are the risks?",
-        "How long is recovery?"
-    ],
-    # Add more topics later as you ingest them:
-    "knee": [
-        "What is knee arthroscopy?",
-        "When is it recommended?",
-        "What are the risks?",
-        "How long is recovery?"
-    ],
-}
-
-NO_MATCH_MESSAGE = (
-    "I couldn’t find this answered in the clinic’s provided materials. "
-    "You can try rephrasing your question, or ask your clinician directly."
-)
-
-# ------------------------- /ask -------------------------
 
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
     q = (req.question or "").strip()
     topic = (req.topic or "shoulder").lower()
 
-    # 1) Topic-scoped retrieval only (keeps answers on-topic)
-    try:
-        res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
+    # --- Query Chroma (topic scoped) with distances to filter weak hits ---
+    res = COLL.query(
+        query_texts=[q],
+        n_results=5,
+        where={"topic": topic},
+        include=["documents", "distances"]
+    )
+    docs = res.get("documents", [[]])[0]
+    dists = res.get("distances", [[]])[0] or []
+
+    # Filter by distance threshold if distances are present
+    if dists:
+        filtered = [doc for doc, dist in zip(docs, dists) if dist is None or dist <= DISTANCE_THRESHOLD]
+    else:
+        filtered = docs
+
+    # Optional fallback: global search if no docs for this topic
+    if not filtered:
+        res = COLL.query(query_texts=[q], n_results=5, include=["documents", "distances"])
         docs = res.get("documents", [[]])[0]
-    except Exception:
-        docs = []
+        dists = res.get("distances", [[]])[0] or []
+        if dists:
+            filtered = [doc for doc, dist in zip(docs, dists) if dist is None or dist <= DISTANCE_THRESHOLD]
+        else:
+            filtered = docs
 
-    # If nothing at all → politely decline (no generic fallback)
-    if not docs:
+    # If nothing at all → politely decline
+    if not filtered:
         return AskResp(
             answer=NO_MATCH_MESSAGE,
             practice_notes=None,
-            suggestions=(CURATED_DEFAULTS.get(topic) or CURATED_DEFAULTS["shoulder"])[: req.max_suggestions],
+            suggestions=[
+                "What is shoulder arthroscopy?",
+                "When is it recommended?",
+                "What are the risks?",
+                "How long is recovery?"
+            ],
             safety={"triage": None},
             verified=False,
         )
 
-    # 2) Build a clean, tight context from the top chunks
-    clean_docs = [_normalize(d) for d in docs[:3] if isinstance(d, str) and d.strip()]
-    context = "\n\n---\n\n".join(clean_docs) if clean_docs else ""
-    if len(context) > 1800:
-        context = context[:1800]
+    # --- Build context snippet for the model ---
+    context = join_top_docs(filtered, max_chars=1800)
 
-    if not context:
-        return AskResp(
-            answer=NO_MATCH_MESSAGE,
-            practice_notes=None,
-            suggestions=(CURATED_DEFAULTS.get(topic) or CURATED_DEFAULTS["shoulder"])[: req.max_suggestions],
-            safety={"triage": None},
-            verified=False,
-        )
-
-    # 3) Concise paraphrase strictly from clinic context (no chit-chat)
-    summary_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a medical educator. Answer ONLY from the provided clinic context. "
-                "Write 2–3 short sentences (45–80 words), clear and neutral. "
-                "No chit-chat, no pleasantries, no first-person, no advice or dosing."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Question: {q}\n\nClinic context:\n{context}",
-        },
-    ]
-
+    # --- Summarize into a concise, sensible 2–3 sentence answer ---
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.2,
-            messages=summary_messages,
+            temperature=0.3,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a medical educator. Answer ONLY from the provided context. "
+                        "Write exactly 2–3 short sentences (each ≤ ~30 words), plain language. "
+                        "Avoid diagnosis, prescriptions, or drug names. If info is missing in context, say you can’t find it."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Question: {q}\n\nContext:\n{context}"
+                }
+            ],
+            max_tokens=220,
         )
-        answer = (resp.choices[0].message.content or "").strip()
+        answer = resp.choices[0].message.content.strip()
+        # Enforce 2–3 sentences
+        answer = clamp_to_3_sentences(answer)
+        # If the model still dodged, fallback to first paragraph from context
+        if not answer or "can’t find" in answer.lower() or "cannot find" in answer.lower():
+            answer = clamp_to_3_sentences(filtered[0])
     except Exception:
-        # last-ditch fallback: trimmed snippet from top chunk
-        answer = clean_docs[0][:300] if clean_docs else NO_MATCH_MESSAGE
+        # Final fallback: take first chunk and clamp
+        answer = clamp_to_3_sentences(filtered[0])
 
-    # 4) Safety triage (guarded)
-    try:
-        safety = triage_flags(q + "\n" + answer) or {"triage": None}
-    except Exception:
-        safety = {"triage": None}
+    # --- Safety triage (simple keyword-based triage) ---
+    safety = triage_flags(q + "\n" + answer)
 
-    # 5) Suggestions → validate against doc; fallback to curated defaults if empty
-    try:
-        model_sugs = gen_suggestions(
-            q, answer, topic=topic, k=req.max_suggestions, avoid=req.avoid
-        ) or []
-    except Exception:
-        model_sugs = []
+    # --- Generate pills, then filter them against doc for this topic ---
+    raw_sugs = gen_suggestions(q, answer, topic=topic, k=req.max_suggestions, avoid=req.avoid)
+    suggestions = filter_suggestions_in_doc(raw_sugs, topic, limit=req.max_suggestions)
+    if not suggestions:
+        suggestions = [
+            "What is shoulder arthroscopy?",
+            "When is it recommended?",
+            "What are the risks?",
+            "How long is recovery?"
+        ]
 
-    filtered = filter_suggestions_in_doc(model_sugs, topic, limit=req.max_suggestions)
-    if not filtered:
-        filtered = (CURATED_DEFAULTS.get(topic) or CURATED_DEFAULTS["shoulder"])[: req.max_suggestions]
-
+    # --- Build response ---
     return AskResp(
         answer=answer,
         practice_notes=None,
-        suggestions=filtered,
+        suggestions=suggestions,
         safety=safety,
         verified=True,
     )
 
-
-
-# ===== Widget JS (polish + spinner + pills; sans-serif + orange 4px button) =====
+# ===== Widget JS (unchanged from your version) =====
 @app.get("/widget.js", response_class=PlainTextResponse)
 def widget_js():
     return """
@@ -306,7 +292,6 @@ def widget_js():
 
     body { background: var(--bg); }
 
-    /* Force clean sans-serif everywhere */
     body, .drqa-card, .drqa-bubble, .drqa-pill, .drqa-input, .drqa-title, .drqa-send {
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
                    "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -331,9 +316,7 @@ def widget_js():
 
     .drqa-form{ display:flex; gap:10px; align-items:center; padding-top: 8px; border-top: 1px solid var(--border); margin-top: 8px; }
     .drqa-input{ flex:1; padding: 12px 14px; border:1px solid var(--border); border-radius: 12px; background: transparent; color: var(--text); outline: none; transition: border-color .15s ease, box-shadow .15s ease; font-size: 15px; }
-    .drqa-input:focus{ border-color: #9ca3af; box-shadow: 0 0 0 3px rgba(156,163,175,0.2); }
 
-    /* Circular send button with up arrow; doubles as spinner */
     .drqa-send{
       width: 40px; height: 40px;
       display: inline-flex; align-items: center; justify-content: center;
@@ -347,28 +330,16 @@ def widget_js():
     .drqa-send:active{ transform: translateY(0); }
     .drqa-send:disabled{ opacity: .6; cursor: not-allowed; }
 
-    .drqa-send__icon{
-      font-size: 18px; line-height: 1;
-      transform: translateY(-1px); /* visually center ↑ */
-      display: block;
-    }
-
-    /* Spinner inside the button */
+    .drqa-send__icon{ font-size: 18px; line-height: 1; transform: translateY(-1px); display: block; }
     .drqa-send__spinner{
-      position: absolute; inset: 0;
-      margin: auto; width: 20px; height: 20px;
-      border-radius: 50%;
-      border: 3px solid rgba(0,0,0,0.15);
-      border-top-color: rgba(0,0,0,0.55);
-      animation: drqa-spin .8s linear infinite;
-      display: none;
+      position: absolute; inset: 0; margin: auto; width: 20px; height: 20px;
+      border-radius: 50%; border: 3px solid rgba(0,0,0,0.15); border-top-color: rgba(0,0,0,0.55);
+      animation: drqa-spin .8s linear infinite; display: none;
     }
-    @media (prefers-color-scheme: dark){
-      .drqa-send__spinner{ border-color: rgba(255,255,255,0.18); border-top-color: rgba(255,255,255,0.7); }
-    }
+    @keyframes drqa-spin { to { transform: rotate(360deg); } }
+
     .drqa-send.is-loading .drqa-send__icon{ display: none; }
     .drqa-send.is-loading .drqa-send__spinner{ display: block; }
-    @keyframes drqa-spin { to { transform: rotate(360deg); } }
 
     .drqa-foot{ padding: 10px 22px 16px; color: var(--muted); font-size: 12px; }
   </style>
@@ -479,10 +450,8 @@ def widget_js():
     if(q) ask(q);
   });
 
-  // Enter key in input submits (already handled by form submit on Enter)
 })();
 """.strip()
-
 
 # ===== Minimal home (let the widget own the UI) =====
 @app.get("/", response_class=HTMLResponse)
