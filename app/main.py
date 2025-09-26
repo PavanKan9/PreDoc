@@ -24,6 +24,33 @@ INDEX_DIR = os.path.join(DATA_DIR, "chroma")
 # Retrieval strictness (lower = stricter)
 DISTANCE_THRESHOLD = float(os.environ.get("DISTANCE_THRESHOLD", "0.35"))
 
+# --- helpers for minimal behavior changes ---
+def _paraphrase_once(q: str) -> str:
+    """
+    Single-shot neutral paraphrase to improve recall only when the first retrieval is empty.
+    Preserves meaning; no new claims. Returns original on failure.
+    """
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "Paraphrase the user's medical question in one sentence. Preserve meaning; don't add new claims."},
+                {"role": "user", "content": q},
+            ],
+        )
+        p = (r.choices[0].message.content or "").strip()
+        return p or q
+    except Exception:
+        return q
+
+def _looks_verified(dists) -> bool:
+    """Smaller distance is better. Verified if top distance < DISTANCE_THRESHOLD."""
+    try:
+        return bool(dists) and dists[0] is not None and float(dists[0]) < DISTANCE_THRESHOLD
+    except Exception:
+        return False
+
 # ===== App & middleware =====
 client = OpenAI()
 app = FastAPI()
@@ -187,10 +214,22 @@ async def ask(req: AskReq):
 
     # 1) Retrieval (global for single-doc setup)
     try:
-        res = COLL.query(query_texts=[q], n_results=5)
+        res = COLL.query(query_texts=[q], n_results=5, include=["documents","distances"])
         docs = res.get("documents", [[]])[0]
+        dists = res.get("distances", [[]])[0] or []
     except Exception:
-        docs = []
+        docs, dists = [], []
+
+    # If nothing retrieved (or only empty strings), paraphrase once and retry
+    if (not docs) or all((not (d or "").strip()) for d in docs):
+        q2 = _paraphrase_once(q)
+        if q2 and q2 != q:
+            try:
+                res = COLL.query(query_texts=[q2], n_results=5, include=["documents","distances"])
+                docs = res.get("documents", [[]])[0]
+                dists = res.get("distances", [[]])[0] or []
+            except Exception:
+                docs, dists = [], []
 
     if not docs:
         return AskResp(
@@ -266,7 +305,10 @@ async def ask(req: AskReq):
     except Exception:
         answer = NO_MATCH_MESSAGE
 
-    verified = (answer != NO_MATCH_MESSAGE)
+    # Verified via top embedding distance; if not verified and not the standard not-found message, prefix explicitly.
+    verified = _looks_verified(dists)
+    if (not verified) and (answer.strip() != NO_MATCH_MESSAGE.strip()):
+        answer = "**Not found in your uploaded clinic material.** Here is general information:\n\n" + answer
 
     # 4) Safety triage
     try:
