@@ -423,6 +423,6 @@ def home():
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=10" defer></script>
+  <script src="/widget.js?v=11" defer></script>
 </body>
 </html>"""
