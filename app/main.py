@@ -243,7 +243,8 @@ def widget_js():
         --shadow: 0 8px 28px rgba(0,0,0,0.45);
       }
     }
-
+    body, .drqa-card, .drqa-bubble, .drqa-pill, .drqa-input, .drqa-btn, .drqa-title {
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif }
     body{ background: var(--bg); }
     .drqa-wrap{ max-width: 760px; margin: 0 auto; padding: 32px 20px 56px; }
     .drqa-card{ background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
@@ -265,11 +266,19 @@ def widget_js():
     .drqa-form{ display:flex; gap:10px; align-items:center; padding-top: 8px; border-top: 1px solid var(--border); margin-top: 8px; }
     .drqa-input{ flex:1; padding: 12px 14px; border:1px solid var(--border); border-radius: 12px; background: transparent; color: var(--text); outline: none; transition: border-color .15s ease, box-shadow .15s ease; font-size: 15px; }
     .drqa-input:focus{ border-color: #9ca3af; box-shadow: 0 0 0 3px rgba(156,163,175,0.2); }
-    .drqa-btn{ padding: 11px 16px; border:0; border-radius:12px; background: var(--accent); color:#fff; cursor:pointer; font-weight:600; transition: opacity .15s ease, transform .15s ease; }
-    .drqa-btn:hover{ opacity:.92; transform: translateY(-1px); }
-    .drqa-btn:active{ transform: translateY(0); }
-
-    .drqa-foot{ padding: 10px 22px 16px; color: var(--muted); font-size: 12px; }
+    .drqa-btn {
+      padding: 11px 16px;
+      border: 0;
+      border-radius: 12px;
+      background: #ff9900;   /* Amazon orange */
+      color: #111;           /* dark text for contrast */
+      cursor: pointer;
+      font-weight: 600;
+      transition: opacity .15s ease, transform .15s ease;
+      }
+     .drqa-btn:hover { opacity:.92; transform: translateY(-1px); }
+     .drqa-btn:active{ transform: translateY(0); }.drqa-btn:hover{ opacity:.92; transform: translateY(-1px); }
+     .drqa-foot{ padding: 10px 22px 16px; color: var(--muted); font-size: 12px; }
 
     /* Spinner */
     .drqa-spinner { width: 22px; height: 22px; border-radius: 50%; border: 3px solid rgba(0,0,0,0.12); border-top-color: rgba(0,0,0,0.55); animation: drqa-spin 0.8s linear infinite; display: none; }
@@ -392,7 +401,7 @@ def home():
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=8" defer></script>
+  <script src="/widget.js?v=9" defer></script>
 </body>
 </html>"""
 
