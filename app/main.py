@@ -237,22 +237,23 @@ async def ask(req: AskReq):
         context = context[:1800]
 
     # 3) Concise paraphrase STRICTLY from clinic material (no fallback to general knowledge)
-    summary_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a medical explainer. "
-                "Answer ONLY using the provided material. "
-                "Write 2–3 clear sentences (45–80 words), neutral tone. "
-                "Do not add pleasantries, introductions, or disclaimers. "
-                f"If the material does not answer the question, reply EXACTLY with: {NO_MATCH_MESSAGE}"
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Question: {q}\n\nMaterial:\n{context}",
-        },
-    ]
+   summary_messages = [
+    {
+        "role": "system",
+        "content": (
+            "You are a medical explainer. "
+            "Write 2–3 clear sentences (45–80 words) using only the provided material. "
+            "Start directly with the answer; do not refer to documents, material, context, sources, or clinics. "
+            "Do not add pleasantries, introductions, or disclaimers. "
+            "Use the document’s terminology when naming conditions or procedures. "
+            f"If the material does not answer the question, reply EXACTLY with: {NO_MATCH_MESSAGE}"
+        ),
+    },
+    {
+        "role": "user",
+        "content": f"Question: {q}\n\nMaterial:\n{context}",
+    },
+]
 
     try:
         resp = client.chat.completions.create(
@@ -272,20 +273,42 @@ async def ask(req: AskReq):
     except Exception:
         safety = {"triage": None}
 
-    # 5) Suggestions (keep your current flow; fall back if empty)
+   # 5) Suggestions (generate, then filter to shoulder-only)
     try:
         suggestions = gen_suggestions(
             q, answer, topic=topic, k=max_k, avoid=req.avoid
         ) or []
     except Exception:
         suggestions = []
-    if not suggestions:
-        suggestions = [
-            "What is shoulder arthroscopy?",
-            "When is it recommended?",
-            "What are the risks?",
-            "How long is recovery?"
-        ][:max_k]
+
+    # --- Shoulder-only pill filter ---
+    SHOULDER_DEFAULTS = [
+        "What is shoulder arthroscopy?",
+        "When is it recommended?",
+        "What are the risks?",
+        "How long is recovery?",
+    ]
+
+    OFF_TOPIC_TERMS = {"knee", "hip", "spine", "ankle", "wrist", "elbow", "back", "neck"}
+
+    def _shoulder_only(sugs, limit):
+        out = []
+        for s in (sugs or []):
+            low = (s or "").lower()
+            if any(t in low for t in OFF_TOPIC_TERMS):
+                continue
+            label = s.strip()
+            if label and not label.endswith("?"):
+                label += "?"
+            out.append(label)
+            if len(out) >= limit:
+                break
+        return out
+
+    filtered = _shoulder_only(suggestions, max_k)
+    if not filtered:
+        filtered = SHOULDER_DEFAULTS[:max_k]
+    suggestions = filtered
 
     return AskResp(
         answer=answer,
@@ -534,6 +557,6 @@ def home():
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=14" defer></script>
+  <script src="/widget.js?v=15" defer></script>
 </body>
 </html>"""
