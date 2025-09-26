@@ -375,36 +375,25 @@ def widget_js():
 })();
 """.strip()
 
-@app.get("/", response_model=None, response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def home():
-    return """<!DOCTYPE html>
+    return """<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Patient Education</title>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PreDoc — Patient Education Chat</title>
   <meta name="color-scheme" content="light dark">
-  <style>
-    html,body{height:100%;}
-    body{
-      margin:0;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Inter, system-ui, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-      background: linear-gradient(180deg, #f5f5f7 0%, #ffffff 100%);
-    }
-    @media (prefers-color-scheme: dark){
-      body{ background: linear-gradient(180deg, #0b0b0c 0%, #0f1012 100%); }
-    }
-    .frame{
-      min-height:100%;
-      display:flex; align-items:flex-start; justify-content:center;
-      padding: 42px 18px 80px;
-    }
-  </style>
+  <style>body{margin:0;background:#f5f5f7}</style>
 </head>
 <body>
-  <div class="frame">
-    <div id="drqa-root"></div>
-  </div>
-  <script src="/widget.js?v=10" defer></script>
+  <div id="drqa-root"></div>
+  <script>
+    // point to your API & default topic; tweak anytime
+    window.DRQA_API_URL = location.origin;
+    window.DRQA_TOPIC = "shoulder";
+  </script>
+  <script src="/widget.js?v=8" defer></script>
 </body>
 </html>"""
+
+
