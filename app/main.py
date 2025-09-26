@@ -108,43 +108,35 @@ def first_two_sents(txt: str) -> str:
 
 @app.post("/ask", response_model=AskResp)
 async def ask(req: AskReq):
-    """
-    - If retrieval yields relevant passages (distance <= threshold): concise 2–3 line paraphrase (verified=True).
-    - If not: politely say it's not covered in clinic materials (no general fallback; verified=False).
-    - Suggestions still adapt; urgent-care pill still prepends on flags.
-    """
-    q = req.question.strip()
+    q = (req.question or "").strip()
     topic = (req.topic or "shoulder").lower()
 
-    # 1) Retrieve with distances (topic first, then fallback to no topic)
-    res = COLL.query(
-        query_texts=[q],
-        n_results=5,
-        where={"topic": topic},
-        include_distances=True
-    )
+    # --- Query Chroma ---
+    res = COLL.query(query_texts=[q], n_results=5, where={"topic": topic})
     docs = res.get("documents", [[]])[0]
-    dists = res.get("distances", [[]])[0]
 
+    # Fallback: global search if no docs for topic
     if not docs:
-        res = COLL.query(query_texts=[q], n_results=5, include_distances=True)
+        res = COLL.query(query_texts=[q], n_results=5)
         docs = res.get("documents", [[]])[0]
-        dists = res.get("distances", [[]])[0]
 
-    # 2) Decide if doc-based answer is strong enough
-    has_match = bool(docs) and any(d <= DISTANCE_THRESHOLD for d in (dists or []))
+    # If nothing at all → politely decline
+    if not docs:
+        return AskResp(
+            answer="I couldn’t find this answered in the clinic’s provided materials. "
+                   "You can try rephrasing your question, or ask your clinician directly.",
+            practice_notes=None,
+            suggestions=[],
+            safety={"triage": None},
+            verified=False,
+        )
 
-    if has_match:
-        # Build focused context from best matches within threshold
-        paired = [(d, t) for d, t in zip(dists, docs)]
-        paired.sort(key=lambda x: x[0])
-        top = [t for d, t in paired if d <= DISTANCE_THRESHOLD][:3]
-        context = "\n\n---\n\n".join(top)
-        if len(context) > 1800:
-            context = context[:1800]
+    # --- Summarize top docs with OpenAI ---
+    context = "\n\n---\n\n".join(docs[:3])
+    if len(context) > 1800:
+        context = context[:1800]
 
-        # Paraphrase concisely from clinic docs (verified=True)
-        summary_prompt = f"""
+    summary_prompt = f"""
 You are a medical educator. Write a concise explanation in 2–3 lines (~60 words),
 based only on the context below. Slightly paraphrase for clarity.
 Do not diagnose, prescribe, or mention drug dosages.
@@ -153,54 +145,44 @@ Context:
 {context}
 
 Question: {q}
-        """.strip()
+    """.strip()
 
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                temperature=0.4,
-                messages=[{"role": "user", "content": summary_prompt}],
-            )
-            candidate = resp.choices[0].message.content.strip()
-            if len(candidate) > 420:
-                candidate = candidate[:420].rstrip()
-            answer = candidate
-            verified = True
-        except Exception:
-            # Fallback: short verbatim snippets if LLM fails unexpectedly
-            snippets = [first_two_sents(t) for t in top]
-            answer = " ".join(s for s in snippets if s) or NO_MATCH_MESSAGE
-            verified = True
-    else:
-        # Not covered in docs — do NOT generate general content
-        answer = NO_MATCH_MESSAGE
-        verified = False
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.4,
+            messages=[{"role": "user", "content": summary_prompt}],
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        # Fallback if LLM hiccups: just return a snippet
+        import re as _re
+        def _two_sents(t: str) -> str:
+            s = _re.split(r"(?<=[.!?])\s+", t.strip())
+            return " ".join(s[:2]).strip()
+        answer = _two_sents(docs[0])
 
-    # 3) Safety triage
-    safety = triage_flags(q + "\n" + (answer or ""))
+    # --- Suggestions & safety (guarded) ---
+    try:
+        safety = triage_flags(q + "\n" + answer) or {"triage": None}
+    except Exception:
+        safety = {"triage": None}
 
-    # 4) Suggestions (model-driven with avoidance list; fallbacks handled in sugg.py)
-    suggestions = gen_suggestions(
-        q, answer, topic=topic or "shoulder", k=req.max_suggestions, avoid=req.avoid
-    )
-
-    # 5) Urgent pill on top if flagged
-    urgent = {
-        "urgent_care": "Seek urgent care — learn more",
-        "er": "Call emergency services — what to do now",
-    }
-    if safety.get("triage") in urgent:
-        label = urgent[safety["triage"]]
-        suggestions = [label] + [s for s in suggestions if s != label]
-        suggestions = suggestions[: req.max_suggestions]
+    try:
+        suggestions = gen_suggestions(
+            q, answer, topic=topic, k=req.max_suggestions, avoid=req.avoid
+        ) or []
+    except Exception:
+        suggestions = []
 
     return AskResp(
         answer=answer,
         practice_notes=None,
         suggestions=suggestions,
         safety=safety,
-        verified=verified,
+        verified=True,
     )
+
 
 # ===== Widget JS (polish + spinner + pills; sans-serif + orange 4px button) =====
 @app.get("/widget.js", response_class=PlainTextResponse)
