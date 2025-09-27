@@ -2,8 +2,8 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from pydantic import BaseModel
-from typing import List, Optional
-import os, re
+from typing import List, Optional, Set
+import os, re, string
 
 from openai import OpenAI
 import chromadb
@@ -25,7 +25,7 @@ UNVERIFIED_SUFFIX = (
     "This information is not verified by the clinic; please contact your provider with questions."
 )
 
-# Internal sentinel used only for logic (never shown directly to users)
+# Internal sentinel used only for logic (never shown to users)
 NO_MATCH_MESSAGE = (
     "I couldn’t find this answered in the clinic’s provided materials. "
     "You can try rephrasing your question, or ask your clinician directly."
@@ -141,19 +141,57 @@ def _paraphrase_once(q: str) -> str:
     except Exception:
         return q
 
-def _retrieve(q: str, n: int = 5, topic: Optional[str] = None):
-    """Single-doc retrieval, scoped by topic metadata when provided."""
-    try:
-        kwargs = {"query_texts": [q], "n_results": n}
-        if topic:
-            kwargs["where"] = {"topic": topic}
-        res = COLL.query(**kwargs)
-        return res.get("documents", [[]])[0]
-    except Exception:
-        return []
+_STOPWORDS = {
+    "the","a","an","and","or","of","to","in","on","for","with","without","by","about","from",
+    "is","are","was","were","be","being","been","do","does","did","can","could","should","would",
+    "how","what","when","why","where","which","who","whom","that","this","these","those","it",
+    "as","at","into","over","under","than","then","so","if","but"
+}
 
-def _build_context(docs: List[str], max_chars: int = 1800) -> str:
-    clean_docs = [_normalize(d) for d in docs[:3] if isinstance(d, str) and d.strip()]
+def _keywordify(q: str, limit: int = 10) -> str:
+    """Extract simple keyword string to improve retrieval."""
+    low = (q or "").lower()
+    trans = str.maketrans("", "", string.punctuation)
+    tokens = [t.translate(trans) for t in low.split()]
+    keywords = [t for t in tokens if t and (t not in _STOPWORDS)]
+    # keep order and dedupe
+    seen = set()
+    out = []
+    for t in keywords:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+        if len(out) >= limit:
+            break
+    return " ".join(out) if out else (q or "")
+
+def _retrieve_many(queries: List[str], n_each: int = 6, topic: Optional[str] = None) -> List[str]:
+    """Run multiple queries and merge unique docs preserving rank."""
+    ids_seen: Set[int] = set()
+    merged: List[str] = []
+    for q in queries:
+        if not q:
+            continue
+        try:
+            kwargs = {"query_texts": [q], "n_results": n_each}
+            if topic:
+                kwargs["where"] = {"topic": topic}
+            res = COLL.query(**kwargs)
+            docs = res.get("documents", [[]])[0]
+        except Exception:
+            docs = []
+        for d in docs:
+            if isinstance(d, str) and d.strip():
+                # Use object id to dedupe by content identity (fallback to hash)
+                key = id(d)
+                if key in ids_seen:
+                    continue
+                ids_seen.add(key)
+                merged.append(d)
+    return merged
+
+def _build_context(docs: List[str], max_docs: int = 6, max_chars: int = 3200) -> str:
+    clean_docs = [_normalize(d) for d in docs[:max_docs] if isinstance(d, str) and d.strip()]
     context = "\n\n---\n\n".join(clean_docs)
     return context[:max_chars] if context else ""
 
@@ -180,7 +218,7 @@ def _summarize_from_context(q: str, context: str) -> str:
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.2,
+            temperature=0.1,
             messages=summary_messages,
         )
         return (resp.choices[0].message.content or "").strip()
@@ -208,15 +246,15 @@ def _external_answer(q: str) -> str:
     except Exception:
         return "Here is general educational information based on typical medical guidance."
 
-# Body part detection for cross-topic guard
+# Body part detection for cross-topic guard (removed generic 'back' to avoid false positives)
 _BODY_PARTS = {
-    "shoulder": {"shoulder"},
+    "shoulder": {"shoulder", "rotator cuff", "labrum", "biceps tendon"},
     "knee": {"knee"},
     "hip": {"hip"},
     "elbow": {"elbow"},
     "wrist": {"wrist"},
     "ankle": {"ankle"},
-    "spine": {"spine", "back"},
+    "spine": {"spine"},
     "neck": {"neck", "cervical"},
     "hand": {"hand", "hands"},
     "foot": {"foot", "feet"},
@@ -224,7 +262,11 @@ _BODY_PARTS = {
 
 def _mentioned_parts(text: str) -> set:
     low = (text or "").lower()
-    return {part for part, tokens in _BODY_PARTS.items() if any(t in low for t in tokens)}
+    found = set()
+    for part, tokens in _BODY_PARTS.items():
+        if any(t in low for t in tokens):
+            found.add(part)
+    return found
 
 # ----------------------------- /ask -----------------------------
 @app.post("/ask", response_model=AskResp)
@@ -233,16 +275,18 @@ async def ask(req: AskReq):
     topic = (req.topic or "shoulder").lower()
     max_k = req.max_suggestions if isinstance(req.max_suggestions, int) else 4
 
-    # 1) Retrieval
-    docs = _retrieve(q, n=5, topic=topic)
+    # ---- Hybrid retrieval (robust to paraphrase) ----
+    q_par = _paraphrase_once(q)
+    q_kw  = _keywordify(q)
+    queries = [q]
+    if q_par and q_par != q:
+        queries.append(q_par)
+    if q_kw and q_kw not in queries:
+        queries.append(q_kw)
 
-    # If nothing retrieved (or only blanks), paraphrase once and retry retrieval
-    if (not docs) or all((not (d or "").strip()) for d in docs):
-        q2 = _paraphrase_once(q)
-        if q2 and q2 != q:
-            docs = _retrieve(q2, n=5, topic=topic)
+    docs = _retrieve_many(queries, n_each=8, topic=topic)
 
-    # 2) If still nothing, answer externally (UNVERIFIED)
+    # If still nothing, answer externally (UNVERIFIED)
     if not docs:
         ext = _external_answer(q)
         answer = f"{ext}\n\n{UNVERIFIED_SUFFIX}"
@@ -258,13 +302,10 @@ async def ask(req: AskReq):
             "What are the risks?",
             "How long is recovery?",
         ][:max_k]
-        return AskResp(
-            answer=answer, practice_notes=None, suggestions=suggestions,
-            safety=safety, verified=verified
-        )
+        return AskResp(answer=answer, practice_notes=None, suggestions=suggestions, safety=safety, verified=verified)
 
-    # 3) Build context
-    context = _build_context(docs, max_chars=1800)
+    # Build context
+    context = _build_context(docs, max_docs=6, max_chars=3200)
     if not context:
         ext = _external_answer(q)
         answer = f"{ext}\n\n{UNVERIFIED_SUFFIX}"
@@ -280,12 +321,9 @@ async def ask(req: AskReq):
             "What are the risks?",
             "How long is recovery?",
         ][:max_k]
-        return AskResp(
-            answer=answer, practice_notes=None, suggestions=suggestions,
-            safety=safety, verified=verified
-        )
+        return AskResp(answer=answer, practice_notes=None, suggestions=suggestions, safety=safety, verified=verified)
 
-    # 4) Cross-topic guard (prevents shoulder text answering knee/hip questions)
+    # Cross-topic guard (now less aggressive)
     parts_in_q = _mentioned_parts(q)
     if parts_in_q and (topic not in parts_in_q):
         ctx_low = context.lower()
@@ -304,40 +342,38 @@ async def ask(req: AskReq):
                 "What are the risks?",
                 "How long is recovery?",
             ][:max_k]
-            return AskResp(
-                answer=answer, practice_notes=None, suggestions=suggestions,
-                safety=safety, verified=verified
-            )
+            return AskResp(answer=answer, practice_notes=None, suggestions=suggestions, safety=safety, verified=verified)
 
-    # 5) Summarize strictly from context
+    # Summarize strictly from context
     answer = _summarize_from_context(q, context)
 
-    # 6) If still not covered by docs after a paraphrase retry, answer externally
+    # If the model says "not covered", retry with paraphrase context; otherwise verified
+    verified = True
     if answer.strip() == NO_MATCH_MESSAGE.strip():
-        q2 = _paraphrase_once(q)
-        if q2 and q2 != q:
-            docs2 = _retrieve(q2, n=5, topic=topic)
-            ctx2 = _build_context(docs2, max_chars=1800) if docs2 else ""
-            if ctx2:
-                answer2 = _summarize_from_context(q2, ctx2)
-                if answer2.strip() != NO_MATCH_MESSAGE.strip():
-                    answer = answer2
+        # Try paraphrase-only retrieval context as a last doc-grounded attempt
+        docs2 = _retrieve_many([q_par, q_kw], n_each=8, topic=topic)
+        ctx2 = _build_context(docs2, max_docs=6, max_chars=3200) if docs2 else ""
+        if ctx2:
+            answer2 = _summarize_from_context(q, ctx2)
+            if answer2.strip() != NO_MATCH_MESSAGE.strip():
+                answer = answer2
+            else:
+                verified = False
+        else:
+            verified = False
 
-    # 7) Determine verification and optionally fall back
-    if answer.strip() == NO_MATCH_MESSAGE.strip():
+    # If still not verified, external fallback
+    if not verified:
         ext = _external_answer(q)
         answer = f"{ext}\n\n{UNVERIFIED_SUFFIX}"
-        verified = False
-    else:
-        verified = True
 
-    # 8) Safety triage
+    # Safety triage
     try:
         safety = triage_flags(q + "\n" + answer) or {"triage": None}
     except Exception:
         safety = {"triage": None}
 
-    # 9) Suggestions (shoulder-only filter)
+    # Suggestions (shoulder-only filter)
     try:
         suggestions = gen_suggestions(q, answer, topic=topic, k=max_k, avoid=req.avoid) or []
     except Exception:
@@ -349,7 +385,7 @@ async def ask(req: AskReq):
         "What are the risks?",
         "How long is recovery?",
     ]
-    OFF_TOPIC_TERMS = {"knee", "hip", "spine", "ankle", "wrist", "elbow", "back", "neck"}
+    OFF_TOPIC_TERMS = {"knee", "hip", "spine", "ankle", "wrist", "elbow", "neck"}  # removed "back"
 
     def _shoulder_only(sugs, limit):
         out = []
@@ -371,7 +407,6 @@ async def ask(req: AskReq):
         filtered = SHOULDER_DEFAULTS[:max_k]
     suggestions = filtered
 
-    # 10) Return
     return AskResp(
         answer=answer,
         practice_notes=None,
@@ -384,229 +419,4 @@ async def ask(req: AskReq):
 @app.get("/peek")
 def peek(q: str, topic: str = "shoulder"):
     try:
-        scoped = COLL.query(query_texts=[q], n_results=3, where={"topic": topic})
-        global_q = COLL.query(query_texts=[q], n_results=3)
-        return {
-            "scoped_docs": scoped.get("documents", [[]])[0],
-            "scoped_metas": scoped.get("metadatas", [[]])[0],
-            "global_docs": global_q.get("documents", [[]])[0],
-            "global_metas": global_q.get("metadatas", [[]])[0],
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# ===== Widget JS =====
-@app.get("/widget.js", response_class=PlainTextResponse)
-def widget_js():
-    return """
-(function(){
-  var API = (window.DRQA_API_URL || (location.origin));
-  var ROOT_ID = (window.DRQA_ROOT_ID || "drqa-root");
-  var TOPIC = (window.DRQA_TOPIC || "shoulder");
-
-  var root = document.getElementById(ROOT_ID);
-  if(!root){ root = document.createElement("div"); root.id = ROOT_ID; document.body.appendChild(root); }
-
-  root.innerHTML = `
-  <style>
-    :root {
-      --bg: #f5f5f7;
-      --card: #ffffff;
-      --text: #111111;
-      --muted: #6b7280;
-      --border: #e5e7eb;
-      --pill: #f9fafb;
-      --pill-border: #e5e7eb;
-      --user: #e8eefc;
-      --bot: #f6f7f8;
-      --accent: #ff9900;
-      --shadow: 0 10px 30px rgba(0,0,0,0.08);
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #0b0b0c;
-        --card: #111113;
-        --text: #f5f5f7;
-        --muted: #9aa1aa;
-        --border: #1f2125;
-        --pill: #0f1012;
-        --pill-border: #24262b;
-        --user: #12233f;
-        --bot: #151617;
-        --shadow: 0 8px 28px rgba(0,0,0,0.45);
-      }
-    }
-    body { background: var(--bg); }
-    body, .drqa-card, .drqa-bubble, .drqa-pill, .drqa-input, .drqa-title, .drqa-send {
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-                   "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    }
-    .drqa-wrap{ max-width: 760px; margin: 0 auto; padding: 32px 20px 56px; }
-    .drqa-card{ background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
-    .drqa-head{ padding: 18px 22px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-    .drqa-title{ font-size: 18px; font-weight: 600; letter-spacing: .2px; }
-    .drqa-topic{ font-size: 13px; color: var(--muted); border:1px solid var(--border); padding: 6px 10px; border-radius: 999px; background: var(--pill); }
-    .drqa-body{ padding: 10px 22px 18px; }
-    .drqa-messages{ display:flex; flex-direction:column; gap:12px; padding: 16px 0; min-height: 200px; max-height: 58vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-    .drqa-bubble{ max-width: 85%; padding: 11px 13px; line-height: 1.45; border-radius: 14px; white-space: pre-wrap; border: 1px solid var(--border); opacity: 0; transform: translateY(4px); animation: drqa-in .18s ease forwards; }
-    .drqa-bubble.user{ align-self:flex-end; background: var(--user); }
-    .drqa-bubble.bot{ align-self:flex-start; background: var(--bot); }
-    @keyframes drqa-in { to { opacity:1; transform: translateY(0); } }
-    .drqa-pills{ display:flex; flex-wrap:wrap; gap:8px; padding: 6px 0 12px; }
-    .drqa-pill{ border:1px solid var(--pill-border); background: var(--pill); border-radius: 999px; padding: 8px 12px; cursor:pointer; font-size: 14px; transition: all .15s ease; user-select:none; }
-    .drqa-pill:hover{ transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
-    .drqa-pill:active{ transform: translateY(0); }
-    .drqa-form{ display:flex; gap:10px; align-items:center; padding-top: 8px; border-top: 1px solid var(--border); margin-top: 8px; }
-    .drqa-input{ flex:1; padding: 12px 14px; border:1px solid var(--border); border-radius: 12px; background: transparent; color: var(--text); outline: none; transition: border-color .15s ease, box-shadow .15s ease; font-size: 15px; }
-    .drqa-send{
-      width: 40px; height: 40px;
-      display: inline-flex; align-items: center; justify-content: center;
-      border: 0; border-radius: 9999px;
-      background: var(--accent); color: #111;
-      cursor: pointer; font-weight: 700;
-      transition: transform .15s ease, opacity .15s ease;
-      position: relative; flex: 0 0 auto;
-    }
-    .drqa-send:hover{ transform: translateY(-1px); }
-    .drqa-send:active{ transform: translateY(0); }
-    .drqa-send:disabled{ opacity: .6; cursor: not-allowed; }
-    .drqa-send__icon{ font-size: 18px; line-height: 1; transform: translateY(-1px); display: block; }
-    .drqa-send__spinner{
-      position: absolute; inset: 0; margin: auto; width: 20px; height: 20px;
-      border-radius: 50%; border: 3px solid rgba(0,0,0,0.15); border-top-color: rgba(0,0,0,0.55);
-      animation: drqa-spin .8s linear infinite; display: none;
-    }
-    @keyframes drqa-spin { to { transform: rotate(360deg); } }
-    .drqa-send.is-loading .drqa-send__icon{ display: none; }
-    .drqa-send.is-loading .drqa-send__spinner{ display: block; }
-    .drqa-foot{ padding: 10px 22px 16px; color: var(--muted); font-size: 12px; }
-  </style>
-
-  <div class="drqa-wrap">
-    <div class="drqa-card">
-      <div class="drqa-head">
-        <div class="drqa-title">Patient Education</div>
-        <div class="drqa-topic">Topic: <span id="drqa-topic-text"></span></div>
-      </div>
-
-      <div class="drqa-body">
-        <div id="drqa-messages" class="drqa-messages"></div>
-        <div id="drqa-pills" class="drqa-pills"></div>
-
-        <form id="drqa-form" class="drqa-form">
-          <input id="drqa-input" class="drqa-input" type="text" placeholder="Ask about your shoulder…" autocomplete="off">
-          <button id="drqa-send" class="drqa-send" type="submit" aria-label="Send">
-            <span class="drqa-send__icon">↑</span>
-            <span class="drqa-send__spinner" aria-hidden="true"></span>
-          </button>
-        </form>
-      </div>
-
-      <div class="drqa-foot">
-        Educational information only — not medical advice.
-      </div>
-    </div>
-  </div>
-  `;
-
-  var topicEl = root.querySelector("#drqa-topic-text");
-  topicEl.textContent = (TOPIC.charAt(0).toUpperCase() + TOPIC.slice(1));
-
-  var msgs   = root.querySelector("#drqa-messages");
-  var pills  = root.querySelector("#drqa-pills");
-  var form   = root.querySelector("#drqa-form");
-  var input  = root.querySelector("#drqa-input");
-  var send   = root.querySelector("#drqa-send");
-
-  function addMsg(text, who){
-    var d = document.createElement("div");
-    d.className = "drqa-bubble " + (who==="user" ? "user" : "bot");
-    d.textContent = text;
-    msgs.appendChild(d); msgs.scrollTop = msgs.scrollHeight;
-  }
-
-  var lastSuggestions = [];
-  function renderPills(arr){
-    lastSuggestions = Array.isArray(arr) ? arr.slice(0) : [];
-    pills.innerHTML = "";
-    (arr||[]).forEach(function(label){
-      var b = document.createElement("button");
-      b.type = "button";
-      b.className = "drqa-pill";
-      b.textContent = label.endsWith("?") ? label : (label + "?");
-      b.onclick = function(){ input.value = b.textContent; form.dispatchEvent(new Event("submit",{cancelable:true})); };
-      pills.appendChild(b);
-    });
-  }
-
-  function setLoading(loading){
-    if(loading){
-      send.classList.add("is-loading");
-      send.setAttribute("aria-busy","true");
-      send.disabled = true;
-      input.disabled = true;
-    }else{
-      send.classList.remove("is-loading");
-      send.removeAttribute("aria-busy");
-      send.disabled = false;
-      input.disabled = false;
-      input.focus();
-    }
-  }
-
-  async function ask(q){
-    addMsg(q, "user"); input.value="";
-    setLoading(true);
-    try{
-      const body = { question: q, topic: TOPIC, avoid: lastSuggestions };
-      var res = await fetch(API + "/ask", {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify(body)
-      });
-      var data = await res.json();
-      addMsg(data.answer || "No answer available.", "bot");
-      renderPills(data.suggestions || []);
-    }catch(e){
-      addMsg("Sorry — something went wrong. Please try again.", "bot");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Defaults (first render)
-  renderPills([
-    "What is shoulder arthroscopy?",
-    "When is it recommended?",
-    "What are the risks?",
-    "How long is recovery?"
-  ]);
-
-  form.addEventListener("submit", function(ev){
-    ev.preventDefault();
-    var q = input.value.trim();
-    if(q) ask(q);
-  });
-})();
-""".strip()
-
-# ===== Minimal home =====
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PreDoc — Patient Education Chat</title>
-  <meta name="color-scheme" content="light dark">
-  <style>body{margin:0;background:#f5f5f7}</style>
-</head>
-<body>
-  <div id="drqa-root"></div>
-  <script>
-    window.DRQA_API_URL = location.origin;
-    window.DRQA_TOPIC = "shoulder";
-  </script>
-  <script src="/widget.js?v=17" defer></script>
-</body>
-</html>"""
+        sco
