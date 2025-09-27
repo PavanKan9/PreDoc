@@ -21,6 +21,16 @@ ALLOW_ORIGINS = [o.strip() for o in os.environ.get("ALLOW_ORIGINS", "").split(",
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 INDEX_DIR = os.path.join(DATA_DIR, "chroma")
 
+UNVERIFIED_SUFFIX = (
+    "This information is not verified by the clinic; please contact your provider with questions."
+)
+
+# Internal sentinel used only for logic (never shown directly to users)
+NO_MATCH_MESSAGE = (
+    "I couldn’t find this answered in the clinic’s provided materials. "
+    "You can try rephrasing your question, or ask your clinician directly."
+)
+
 # ===== App & middleware =====
 client = OpenAI()
 app = FastAPI()
@@ -53,7 +63,7 @@ class AskResp(BaseModel):
     practice_notes: Optional[str] = None
     suggestions: List[str]
     safety: dict
-    verified: bool  # True = grounded in uploaded docs; False = not covered
+    verified: bool  # True = grounded in uploaded docs; False = external/unverified
     disclaimer: str = "Educational information only — not medical advice."
 
 # ===== Utility / debug =====
@@ -104,12 +114,7 @@ async def ingest_file(file: UploadFile = File(...), topic: str = Form("shoulder"
         )
     return {"added": len(chunks)}
 
-# ===== Answering helpers =====
-NO_MATCH_MESSAGE = (
-    "I couldn’t find this answered in the clinic’s provided materials. "
-    "You can try rephrasing your question, or ask your clinician for guidance."
-)
-
+# ===== Helpers =====
 def _normalize(txt: str) -> str:
     """Trim, collapse whitespace, and strip obvious Q:/A: headers."""
     if not isinstance(txt, str):
@@ -121,9 +126,7 @@ def _normalize(txt: str) -> str:
     return t.strip()
 
 def _paraphrase_once(q: str) -> str:
-    """
-    One-shot neutral paraphrase used only as a fallback.
-    """
+    """One-shot neutral paraphrase used only as a fallback for retrieval."""
     try:
         r = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -155,6 +158,7 @@ def _build_context(docs: List[str], max_chars: int = 1800) -> str:
     return context[:max_chars] if context else ""
 
 def _summarize_from_context(q: str, context: str) -> str:
+    """Summarize strictly from provided clinic material; otherwise return NO_MATCH_MESSAGE."""
     if not context:
         return NO_MATCH_MESSAGE
     summary_messages = [
@@ -183,6 +187,27 @@ def _summarize_from_context(q: str, context: str) -> str:
     except Exception:
         return NO_MATCH_MESSAGE
 
+def _external_answer(q: str) -> str:
+    """
+    External fallback: produce a neutral, evidence-based 2–3 sentence answer
+    without referencing clinic docs. The caller appends the unverified suffix.
+    """
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content":
+                 "You are a medical explainer. Answer in 2–3 clear sentences (45–80 words). "
+                 "Be neutral and educational, avoid clinic-specific guidance, and do not include disclaimers."},
+                {"role": "user", "content": q},
+            ],
+        )
+        ans = (r.choices[0].message.content or "").strip()
+        return ans or "Here is general educational information based on typical medical guidance."
+    except Exception:
+        return "Here is general educational information based on typical medical guidance."
+
 # Body part detection for cross-topic guard
 _BODY_PARTS = {
     "shoulder": {"shoulder"},
@@ -199,11 +224,7 @@ _BODY_PARTS = {
 
 def _mentioned_parts(text: str) -> set:
     low = (text or "").lower()
-    found = set()
-    for part, tokens in _BODY_PARTS.items():
-        if any(t in low for t in tokens):
-            found.add(part)
-    return found
+    return {part for part, tokens in _BODY_PARTS.items() if any(t in low for t in tokens)}
 
 # ----------------------------- /ask -----------------------------
 @app.post("/ask", response_model=AskResp)
@@ -211,14 +232,6 @@ async def ask(req: AskReq):
     q = (req.question or "").strip()
     topic = (req.topic or "shoulder").lower()
     max_k = req.max_suggestions if isinstance(req.max_suggestions, int) else 4
-
-    NO_MATCH_MESSAGE_LOCAL = (
-        "I couldn’t find this answered in the clinic’s provided materials. "
-        "You can try rephrasing your question, or ask your clinician directly."
-    )
-    UNVERIFIED_SUFFIX = (
-        "This information is not verified by the clinic; please contact your provider with questions."
-    )
 
     # 1) Retrieval
     docs = _retrieve(q, n=5, topic=topic)
@@ -229,94 +242,104 @@ async def ask(req: AskReq):
         if q2 and q2 != q:
             docs = _retrieve(q2, n=5, topic=topic)
 
-    # If still nothing, return explicit not-found (and mark unverified + add suffix)
+    # 2) If still nothing, answer externally (UNVERIFIED)
     if not docs:
-        base_answer = NO_MATCH_MESSAGE_LOCAL
-        unverified_answer = f"{base_answer}\n\n{UNVERIFIED_SUFFIX}"
+        ext = _external_answer(q)
+        answer = f"{ext}\n\n{UNVERIFIED_SUFFIX}"
+        verified = False
+        safety = {"triage": None}
+        try:
+            safety = triage_flags(q + "\n" + answer) or {"triage": None}
+        except Exception:
+            pass
+        suggestions = [
+            "What is shoulder arthroscopy?",
+            "When is it recommended?",
+            "What are the risks?",
+            "How long is recovery?",
+        ][:max_k]
         return AskResp(
-            answer=unverified_answer,
-            practice_notes=None,
-            suggestions=[
-                "What is shoulder arthroscopy?",
-                "When is it recommended?",
-                "What are the risks?",
-                "How long is recovery?",
-            ][:max_k],
-            safety={"triage": None},
-            verified=False,
+            answer=answer, practice_notes=None, suggestions=suggestions,
+            safety=safety, verified=verified
         )
 
-    # 2) Build context
+    # 3) Build context
     context = _build_context(docs, max_chars=1800)
     if not context:
-        base_answer = NO_MATCH_MESSAGE_LOCAL
-        unverified_answer = f"{base_answer}\n\n{UNVERIFIED_SUFFIX}"
+        ext = _external_answer(q)
+        answer = f"{ext}\n\n{UNVERIFIED_SUFFIX}"
+        verified = False
+        safety = {"triage": None}
+        try:
+            safety = triage_flags(q + "\n" + answer) or {"triage": None}
+        except Exception:
+            pass
+        suggestions = [
+            "What is shoulder arthroscopy?",
+            "When is it recommended?",
+            "What are the risks?",
+            "How long is recovery?",
+        ][:max_k]
         return AskResp(
-            answer=unverified_answer,
-            practice_notes=None,
-            suggestions=[
-                "What is shoulder arthroscopy?",
-                "When is it recommended?",
-                "What are the risks?",
-                "How long is recovery?",
-            ][:max_k],
-            safety={"triage": None},
-            verified=False,
+            answer=answer, practice_notes=None, suggestions=suggestions,
+            safety=safety, verified=verified
         )
 
-    # 2b) Cross-topic guard (prevents shoulder text answering knee/hip questions)
+    # 4) Cross-topic guard (prevents shoulder text answering knee/hip questions)
     parts_in_q = _mentioned_parts(q)
     if parts_in_q and (topic not in parts_in_q):
         ctx_low = context.lower()
         if not any(any(tok in ctx_low for tok in _BODY_PARTS[p]) for p in parts_in_q):
-            base_answer = NO_MATCH_MESSAGE_LOCAL
-            unverified_answer = f"{base_answer}\n\n{UNVERIFIED_SUFFIX}"
+            ext = _external_answer(q)
+            answer = f"{ext}\n\n{UNVERIFIED_SUFFIX}"
+            verified = False
+            safety = {"triage": None}
+            try:
+                safety = triage_flags(q + "\n" + answer) or {"triage": None}
+            except Exception:
+                pass
+            suggestions = [
+                "What is shoulder arthroscopy?",
+                "When is it recommended?",
+                "What are the risks?",
+                "How long is recovery?",
+            ][:max_k]
             return AskResp(
-                answer=unverified_answer,
-                practice_notes=None,
-                suggestions=[
-                    "What is shoulder arthroscopy?",
-                    "When is it recommended?",
-                    "What are the risks?",
-                    "How long is recovery?",
-                ][:max_k],
-                safety={"triage": None},
-                verified=False,
+                answer=answer, practice_notes=None, suggestions=suggestions,
+                safety=safety, verified=verified
             )
 
-    # 3) Summarize strictly from context
+    # 5) Summarize strictly from context
     answer = _summarize_from_context(q, context)
 
-    # If the model says "not covered", do ONE more paraphrase-retrieve-summarize cycle
-    if answer.strip() == NO_MATCH_MESSAGE_LOCAL.strip():
+    # 6) If still not covered by docs after a paraphrase retry, answer externally
+    if answer.strip() == NO_MATCH_MESSAGE.strip():
         q2 = _paraphrase_once(q)
         if q2 and q2 != q:
             docs2 = _retrieve(q2, n=5, topic=topic)
             ctx2 = _build_context(docs2, max_chars=1800) if docs2 else ""
             if ctx2:
                 answer2 = _summarize_from_context(q2, ctx2)
-                if answer2.strip():
+                if answer2.strip() != NO_MATCH_MESSAGE.strip():
                     answer = answer2
 
-    # 4) Verified = not NO_MATCH_MESSAGE_LOCAL (simple & robust)
-    verified = (answer.strip() != NO_MATCH_MESSAGE_LOCAL.strip())
+    # 7) Determine verification and optionally fall back
+    if answer.strip() == NO_MATCH_MESSAGE.strip():
+        ext = _external_answer(q)
+        answer = f"{ext}\n\n{UNVERIFIED_SUFFIX}"
+        verified = False
+    else:
+        verified = True
 
-    # 4b) If NOT verified, append explicit unverified disclaimer to the answer text
-    if not verified:
-        if not answer.endswith(UNVERIFIED_SUFFIX):
-            answer = f"{answer}\n\n{UNVERIFIED_SUFFIX}"
-
-    # 5) Safety triage
+    # 8) Safety triage
     try:
         safety = triage_flags(q + "\n" + answer) or {"triage": None}
     except Exception:
         safety = {"triage": None}
 
-    # 6) Suggestions (unchanged)
+    # 9) Suggestions (shoulder-only filter)
     try:
-        suggestions = gen_suggestions(
-            q, answer, topic=topic, k=max_k, avoid=req.avoid
-        ) or []
+        suggestions = gen_suggestions(q, answer, topic=topic, k=max_k, avoid=req.avoid) or []
     except Exception:
         suggestions = []
 
@@ -334,10 +357,11 @@ async def ask(req: AskReq):
             low = (s or "").lower()
             if any(t in low for t in OFF_TOPIC_TERMS):
                 continue
-            label = s.strip()
+            label = (s or "").strip()
             if label and not label.endswith("?"):
                 label += "?"
-            out.append(label)
+            if label:
+                out.append(label)
             if len(out) >= limit:
                 break
         return out
@@ -347,6 +371,7 @@ async def ask(req: AskReq):
         filtered = SHOULDER_DEFAULTS[:max_k]
     suggestions = filtered
 
+    # 10) Return
     return AskResp(
         answer=answer,
         practice_notes=None,
@@ -370,7 +395,7 @@ def peek(q: str, topic: str = "shoulder"):
     except Exception as e:
         return {"error": str(e)}
 
-# ===== Widget JS (your original, unchanged) =====
+# ===== Widget JS =====
 @app.get("/widget.js", response_class=PlainTextResponse)
 def widget_js():
     return """
@@ -394,7 +419,7 @@ def widget_js():
       --pill-border: #e5e7eb;
       --user: #e8eefc;
       --bot: #f6f7f8;
-      --accent: #ff9900; /* Amazon orange */
+      --accent: #ff9900;
       --shadow: 0 10px 30px rgba(0,0,0,0.08);
     }
     @media (prefers-color-scheme: dark) {
@@ -411,14 +436,11 @@ def widget_js():
         --shadow: 0 8px 28px rgba(0,0,0,0.45);
       }
     }
-
     body { background: var(--bg); }
-
     body, .drqa-card, .drqa-bubble, .drqa-pill, .drqa-input, .drqa-title, .drqa-send {
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
                    "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
-
     .drqa-wrap{ max-width: 760px; margin: 0 auto; padding: 32px 20px 56px; }
     .drqa-card{ background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
     .drqa-head{ padding: 18px 22px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
@@ -430,15 +452,12 @@ def widget_js():
     .drqa-bubble.user{ align-self:flex-end; background: var(--user); }
     .drqa-bubble.bot{ align-self:flex-start; background: var(--bot); }
     @keyframes drqa-in { to { opacity:1; transform: translateY(0); } }
-
     .drqa-pills{ display:flex; flex-wrap:wrap; gap:8px; padding: 6px 0 12px; }
     .drqa-pill{ border:1px solid var(--pill-border); background: var(--pill); border-radius: 999px; padding: 8px 12px; cursor:pointer; font-size: 14px; transition: all .15s ease; user-select:none; }
     .drqa-pill:hover{ transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
     .drqa-pill:active{ transform: translateY(0); }
-
     .drqa-form{ display:flex; gap:10px; align-items:center; padding-top: 8px; border-top: 1px solid var(--border); margin-top: 8px; }
     .drqa-input{ flex:1; padding: 12px 14px; border:1px solid var(--border); border-radius: 12px; background: transparent; color: var(--text); outline: none; transition: border-color .15s ease, box-shadow .15s ease; font-size: 15px; }
-
     .drqa-send{
       width: 40px; height: 40px;
       display: inline-flex; align-items: center; justify-content: center;
@@ -451,7 +470,6 @@ def widget_js():
     .drqa-send:hover{ transform: translateY(-1px); }
     .drqa-send:active{ transform: translateY(0); }
     .drqa-send:disabled{ opacity: .6; cursor: not-allowed; }
-
     .drqa-send__icon{ font-size: 18px; line-height: 1; transform: translateY(-1px); display: block; }
     .drqa-send__spinner{
       position: absolute; inset: 0; margin: auto; width: 20px; height: 20px;
@@ -459,10 +477,8 @@ def widget_js():
       animation: drqa-spin .8s linear infinite; display: none;
     }
     @keyframes drqa-spin { to { transform: rotate(360deg); } }
-
     .drqa-send.is-loading .drqa-send__icon{ display: none; }
     .drqa-send.is-loading .drqa-send__spinner{ display: block; }
-
     .drqa-foot{ padding: 10px 22px 16px; color: var(--muted); font-size: 12px; }
   </style>
 
@@ -571,11 +587,10 @@ def widget_js():
     var q = input.value.trim();
     if(q) ask(q);
   });
-
 })();
 """.strip()
 
-# ===== Minimal home (unchanged from your version) =====
+# ===== Minimal home =====
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """<!doctype html>
@@ -592,6 +607,6 @@ def home():
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=16" defer></script>
+  <script src="/widget.js?v=17" defer></script>
 </body>
 </html>"""
