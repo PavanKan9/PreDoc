@@ -216,6 +216,9 @@ async def ask(req: AskReq):
         "I couldn’t find this answered in the clinic’s provided materials. "
         "You can try rephrasing your question, or ask your clinician directly."
     )
+    UNVERIFIED_SUFFIX = (
+        "This information is not verified by the clinic; please contact your provider with questions."
+    )
 
     # 1) Retrieval
     docs = _retrieve(q, n=5, topic=topic)
@@ -226,10 +229,12 @@ async def ask(req: AskReq):
         if q2 and q2 != q:
             docs = _retrieve(q2, n=5, topic=topic)
 
-    # If still nothing, return explicit not-found
+    # If still nothing, return explicit not-found (and mark unverified + add suffix)
     if not docs:
+        base_answer = NO_MATCH_MESSAGE_LOCAL
+        unverified_answer = f"{base_answer}\n\n{UNVERIFIED_SUFFIX}"
         return AskResp(
-            answer=NO_MATCH_MESSAGE_LOCAL,
+            answer=unverified_answer,
             practice_notes=None,
             suggestions=[
                 "What is shoulder arthroscopy?",
@@ -244,8 +249,10 @@ async def ask(req: AskReq):
     # 2) Build context
     context = _build_context(docs, max_chars=1800)
     if not context:
+        base_answer = NO_MATCH_MESSAGE_LOCAL
+        unverified_answer = f"{base_answer}\n\n{UNVERIFIED_SUFFIX}"
         return AskResp(
-            answer=NO_MATCH_MESSAGE_LOCAL,
+            answer=unverified_answer,
             practice_notes=None,
             suggestions=[
                 "What is shoulder arthroscopy?",
@@ -262,8 +269,10 @@ async def ask(req: AskReq):
     if parts_in_q and (topic not in parts_in_q):
         ctx_low = context.lower()
         if not any(any(tok in ctx_low for tok in _BODY_PARTS[p]) for p in parts_in_q):
+            base_answer = NO_MATCH_MESSAGE_LOCAL
+            unverified_answer = f"{base_answer}\n\n{UNVERIFIED_SUFFIX}"
             return AskResp(
-                answer=NO_MATCH_MESSAGE_LOCAL,
+                answer=unverified_answer,
                 practice_notes=None,
                 suggestions=[
                     "What is shoulder arthroscopy?",
@@ -291,6 +300,11 @@ async def ask(req: AskReq):
 
     # 4) Verified = not NO_MATCH_MESSAGE_LOCAL (simple & robust)
     verified = (answer.strip() != NO_MATCH_MESSAGE_LOCAL.strip())
+
+    # 4b) If NOT verified, append explicit unverified disclaimer to the answer text
+    if not verified:
+        if not answer.endswith(UNVERIFIED_SUFFIX):
+            answer = f"{answer}\n\n{UNVERIFIED_SUFFIX}"
 
     # 5) Safety triage
     try:
