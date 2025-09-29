@@ -1,0 +1,20 @@
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "uvicorn app.main:app --host 0.0.0.0 --port 8080",
+    "healthcheckPath": "/health",
+    "restartPolicyType": "ON_FAILURE"
+  },
+  "variables": {
+    "DATA_DIR": "/data",
+    "ALLOW_ORIGINS": "*"
+  },
+  "volumes": [
+    {
+      "path": "/data",
+      "sizeGB": 2
+    }
+  ]
+}
