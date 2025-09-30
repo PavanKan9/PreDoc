@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -43,7 +43,7 @@ collection = chroma_client.get_or_create_collection(
 PROCEDURE_TYPES = {
     "General (All Types)": [],
     "Rotator Cuff Repair": ["rotator cuff", "supraspinatus", "infraspinatus", "subscapularis", "teres minor", "rc tear"],
-    "SLAP Repair": ["slap tear", "superior labrum", "biceps anchor", "type ii slap", "labral superior"],
+    "SLAP Repair": ["slap tear", "superior labrum", "biceps anchor", "type ii slap", "labral superior", "slap repair"],
     "Bankart (Anterior Labrum) Repair": ["bankart", "anterior labrum", "anterior instability", "glenoid labrum anterior"],
     "Posterior Labrum Repair": ["posterior labrum", "posterior instability", "reverse bankart"],
     "Biceps Tenodesis/Tenotomy": ["biceps tenodesis", "tenotomy", "biceps tendon", "lhb"],
@@ -165,7 +165,6 @@ def summarize_to_2_or_3_sentences(text: str) -> str:
 def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str]:
     last = (last_q or "").lower()
     base = PROCEDURE_PILLS.get(selected_type or "General (All Types)", PROCEDURE_PILLS["General (All Types)"])
-
     if "recover" in last or "return" in last or "heal" in last:
         return [
             "What rehab milestones should I expect?",
@@ -194,7 +193,6 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
             "When should I taper medications?",
             "What are red flags of uncontrolled pain?",
         ]
-
     if re.search(r"\b(weeks?|months?)\b", answer.lower()) or "sling" in answer.lower():
         return [
             "When do I start passive vs active motion?",
@@ -204,13 +202,12 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
         ]
     return base[:4]
 
-# Additional coverage check to avoid false “unverified”
-def likely_covered(question: str, docs: List[str], dists: List[float], dist_thresh: float = 0.35) -> bool:
+def likely_covered(question: str, docs: List[str], dists: List[float], dist_thresh: float = 0.33) -> bool:
+    # 1) similarity threshold; 2) keyword overlap heuristic to capture paraphrases
     if not dists or not docs:
         return False
     if min(dists) <= dist_thresh:
         return True
-    # keyword overlap heuristic
     q_tokens = set(re.findall(r"[a-z]{3,}", question.lower()))
     for d in docs[:3]:
         d_tokens = set(re.findall(r"[a-z]{3,}", d.lower()))
@@ -229,7 +226,7 @@ app.add_middleware(
 )
 
 # Simple in-memory sessions
-SESSIONS: Dict[str, Dict[str, Any]] = {}  # {id: {title, messages: [{role, content}], selected_type}}
+SESSIONS: Dict[str, Dict[str, Any]] = {}  # {id: {title, messages: [...], selected_type}}
 
 # ========= MODELS =========
 class AskBody(BaseModel):
@@ -240,7 +237,7 @@ class AskBody(BaseModel):
 # ========= ROUTES =========
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # UI matched to your screenshot: centered title, topic chip, subtle pills, clean composer with orange FAB.
+    # Homescreen hero (Welcome + dropdown) -> after selection, switch into the Chat UI styled like your screenshot.
     return HTMLResponse(f"""
 <!doctype html>
 <html lang="en">
@@ -265,17 +262,26 @@ def home():
   /* Sidebar */
   .sidebar {{ border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }}
   .side-title {{ font-size:13px; font-weight:600; color:#333; margin-bottom:8px; }}
-  .skeleton {{
-    height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%;
-  }}
+  .skeleton {{ height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%; }}
   .skeleton:nth-child(2) {{ width:70%; }} .skeleton:nth-child(3) {{ width:60%; }}
 
   /* Main */
   .main {{ display:flex; flex-direction:column; min-width:0; }}
-  .topbar {{
-    display:flex; align-items:center; justify-content:center;
-    padding:16px 18px; border-bottom:1px solid var(--border); position:relative;
+
+  /* HERO */
+  .hero {{ flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }}
+  .hero-inner {{ text-align:center; max-width:820px; }}
+  .hero h1 {{
+    font-size: clamp(30px, 4.5vw, 46px);
+    line-height:1.08; margin:0 0 16px; font-weight:800; letter-spacing:-0.02em;
   }}
+  .hero p {{ color:var(--muted); margin:0 0 22px; font-size:16px; }}
+  .hero .selector {{ display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }}
+  .hero label {{ color:#111; font-weight:600; }}
+  .hero select {{ min-width:280px; border:1px solid var(--border); border-radius:12px; padding:10px 12px; }}
+
+  /* TOPBAR (chat view) */
+  .topbar {{ display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }}
   .title {{ font-size:22px; font-weight:700; letter-spacing:.2px; }}
   .topic-chip {{
     position:absolute; right:18px; top:12px;
@@ -283,7 +289,6 @@ def home():
     padding:8px 14px; border-radius:999px; font-size:13px;
     display:flex; align-items:center; gap:8px; cursor:pointer;
   }}
-  .topic-chip span.sel {{ opacity:.7; }}
   .topic-panel {{
     position:absolute; right:18px; top:52px; background:#fff; border:1px solid var(--border);
     border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:10px; display:none; z-index:10;
@@ -295,8 +300,7 @@ def home():
   .pills {{ display:flex; flex-wrap:wrap; gap:14px; padding:0 24px 12px; }}
   .pill {{
     border:1px solid var(--pill-border); background:#fff; padding:12px 16px; border-radius:999px;
-    font-size:16px; cursor:pointer; line-height:1;
-    box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+    font-size:16px; cursor:pointer; line-height:1; box-shadow: 0 1px 0 rgba(0,0,0,0.02);
   }}
 
   .bubble {{ max-width:820px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0; line-height:1.45; }}
@@ -308,9 +312,7 @@ def home():
     display:flex; align-items:center; gap:10px; max-width:920px;
     border:1px solid var(--border); border-radius:16px; padding:8px 12px; margin:0 auto;
   }}
-  .composer input {{
-    flex:1; border:none; outline:none; font-size:16px; padding:10px 12px;
-  }}
+  .composer input {{ flex:1; border:none; outline:none; font-size:16px; padding:10px 12px; }}
   .fab {{
     width:42px; height:42px; border-radius:50%; background:var(--orange);
     display:flex; align-items:center; justify-content:center; cursor:pointer; border:none;
@@ -329,13 +331,24 @@ def home():
   <aside class="sidebar">
     <div class="side-title">Previous Chats</div>
     <div id="chats"></div>
-    <div class="skeleton"></div>
-    <div class="skeleton"></div>
-    <div class="skeleton"></div>
+    <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
   </aside>
 
   <main class="main">
-    <div class="topbar">
+    <!-- HERO (homescreen) -->
+    <section class="hero" id="hero">
+      <div class="hero-inner">
+        <h1>Welcome! Select the type of surgery below:</h1>
+        <p>Choose your specific shoulder arthroscopy to tailor answers and quick questions.</p>
+        <div class="selector">
+          <label for="typeHero">Type of Shoulder Arthroscopy</label>
+          <select id="typeHero"></select>
+        </div>
+      </div>
+    </section>
+
+    <!-- CHAT VIEW (shown after selection) -->
+    <div class="topbar" id="topbar">
       <div class="title">Patient Education</div>
       <div class="topic-chip" id="topicChip" onclick="toggleTopicPanel()">
         <strong>Topic:</strong> <span class="sel" id="topicText">Shoulder</span>
@@ -345,7 +358,7 @@ def home():
       </div>
     </div>
 
-    <div class="content">
+    <div class="content" id="chatContent" style="display:none;">
       <div class="chat-area" id="chat"></div>
       <div class="pills" id="pills"></div>
 
@@ -363,7 +376,7 @@ def home():
 
 <script>
 let SESSION_ID = null;
-let SELECTED_TYPE = "General (All Types)";
+let SELECTED_TYPE = null;
 
 function toggleTopicPanel() {{
   const p = document.getElementById('topicPanel');
@@ -371,23 +384,58 @@ function toggleTopicPanel() {{
 }}
 
 async function boot() {{
-  // Populate type selector
+  // Populate both dropdowns
   const types = await fetch('/types').then(r=>r.json()).then(d=>d.types||[]);
-  const sel = document.getElementById('typeSelect');
-  sel.innerHTML='';
-  types.forEach(t=>{{ const o=document.createElement('option'); o.value=t; o.textContent=t; sel.appendChild(o); }});
-  sel.value = SELECTED_TYPE;
-  sel.addEventListener('change', () => {{
-    SELECTED_TYPE = sel.value;
-    document.getElementById('topicText').textContent = (SELECTED_TYPE==='General (All Types)'?'Shoulder':SELECTED_TYPE);
-    document.getElementById('topicPanel').style.display='none';
-    addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
-    renderTypePills();
+  const selHero = document.getElementById('typeHero');
+  const selTop  = document.getElementById('typeSelect');
+  [selHero, selTop].forEach(sel => {{
+    sel.innerHTML='';
+    types.forEach(t=>{{ const o=document.createElement('option'); o.value=t; o.textContent=t; sel.appendChild(o); }});
   }});
+  selHero.value = "General (All Types)";
+
+  selHero.addEventListener('change', () => handleTypeChange(selHero.value, true));
+  selTop.addEventListener('change', () => handleTypeChange(selTop.value, false));
 
   await listSessions();
   await newChat(true);
+}}
+
+function handleTypeChange(value, fromHero) {{
+  SELECTED_TYPE = value;
+  // Sync dropdowns + chip label
+  document.getElementById('typeHero').value = value;
+  document.getElementById('typeSelect').value = value;
+  document.getElementById('topicText').textContent = (value==='General (All Types)') ? 'Shoulder' : value;
+
+  // Switch UI to chat view
+  document.getElementById('hero').style.display = 'none';
+  document.getElementById('topbar').style.display = 'flex';
+  document.getElementById('chatContent').style.display = 'flex';
+  document.getElementById('topicPanel').style.display = 'none';
+
+  // Clear chat area for a fresh start on new type (optional)
+  document.getElementById('chat').innerHTML = '';
+
+  // Render type-scoped starter pills
   renderTypePills();
+
+  // Inform scope
+  addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
+}}
+
+function renderTypePills() {{
+  fetch('/pills?type=' + encodeURIComponent(SELECTED_TYPE))
+    .then(r=>r.json())
+    .then(data => {{
+      const pills = data.pills || [];
+      const el = document.getElementById('pills'); el.innerHTML='';
+      pills.forEach(label => {{
+        const b = document.createElement('button'); b.className='pill'; b.textContent=label;
+        b.onclick = () => {{ document.getElementById('q').value = label; ask(); }};
+        el.appendChild(b);
+      }});
+    }});
 }}
 
 async function listSessions() {{
@@ -404,7 +452,7 @@ async function listSessions() {{
 async function newChat(silent=false) {{
   const data = await fetch('/sessions/new', {{method:'POST'}}).then(r=>r.json());
   SESSION_ID = data.session_id;
-  if(!silent) addBot('New chat started. Select a topic and ask a question.');
+  if(!silent) addBot('New chat started. Select a surgery type to begin.');
   await listSessions();
 }}
 
@@ -432,23 +480,10 @@ function scrollBottom() {{
   const el = document.getElementById('chat'); el.scrollTop = el.scrollHeight;
 }}
 
-function renderTypePills() {{
-  fetch('/pills?type=' + encodeURIComponent(SELECTED_TYPE))
-    .then(r=>r.json())
-    .then(data => {{
-      const pills = data.pills || [];
-      const el = document.getElementById('pills'); el.innerHTML='';
-      pills.forEach(label => {{
-        const b = document.createElement('button'); b.className='pill'; b.textContent=label;
-        b.onclick = () => {{ document.getElementById('q').value = label; ask(); }};
-        el.appendChild(b);
-      }});
-    }});
-}}
-
 async function ask() {{
   const q = document.getElementById('q').value.trim();
   if(!q) return;
+  if(!SELECTED_TYPE) {{ addBot('Please select a surgery type first.'); return; }}
   addUser(q); document.getElementById('q').value='';
   const spin = spinner();
   const body = {{question:q, session_id:SESSION_ID, selected_type:SELECTED_TYPE}};
@@ -458,7 +493,7 @@ async function ask() {{
   spin.remove();
   addBot(data.answer);
 
-  // Adaptive pills each time
+  // Adaptive pills from server
   if(data.pills && data.pills.length) {{
     const el = document.getElementById('pills'); el.innerHTML='';
     data.pills.forEach(label => {{
@@ -486,7 +521,7 @@ def get_types():
     return {"types": PROCEDURE_KEYS}
 
 @app.get("/pills")
-def get_pills(type: str):
+def get_pills(type: str = Query(...)):
     pills = PROCEDURE_PILLS.get(type, PROCEDURE_PILLS["General (All Types)"])
     return {"pills": pills[:4]}
 
@@ -559,7 +594,7 @@ def ask(body: AskBody):
     selected_type = body.selected_type or "General (All Types)"
     SESSIONS[sid]["selected_type"] = selected_type
 
-    # Filter by type
+    # Strict filter to the selected type
     where = {}
     if selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
         where = {"type": selected_type}
@@ -577,8 +612,11 @@ def ask(body: AskBody):
     except Exception as e:
         return {"answer": f"Search failed: {type(e).__name__}: {e}", "pills": [], "unverified": False}
 
-    # Coverage check — less strict to handle paraphrases
-    covered = likely_covered(q, docs, dists, dist_thresh=0.35)
+    # Only consider coverage within the selected type
+    covered = likely_covered(q, docs, dists, dist_thresh=0.33)
+
+    # If there are literally no docs for this type in the DB, mark unverified by design
+    no_docs_for_type = (len(docs) == 0)
 
     # Build answer
     unverified = False
@@ -592,7 +630,9 @@ def ask(body: AskBody):
         )
         raw = make_llm_answer(prompt, system="You are a careful medical educator.")
         answer_text = summarize_to_2_or_3_sentences(raw)
+        unverified = False
     else:
+        # Doc did not cover this (within the chosen type) -> unverified fallback
         prompt = (
             f"The clinic document did not cover this clearly for {selected_type}. "
             "Provide a short, patient-friendly answer based on general medical knowledge. "
@@ -601,9 +641,9 @@ def ask(body: AskBody):
         )
         raw = make_llm_answer(prompt, system="You are a careful medical educator.")
         answer_text = summarize_to_2_or_3_sentences(raw)
-        unverified = True  # only set when the doc does not cover it
+        unverified = True
 
-    # Special handling for recommendation question forms
+    # Special handling for "recommended" phrasing
     if re.search(r"\bwhen\s+is\s+(a\s+)?(shoulder\s+)?(arthroscopy|repair|decompression|tenodesis|release|excision)\s+recommended\??", q.lower()):
         if covered and docs:
             ctx = "\n\n".join(docs[:3])
@@ -622,7 +662,7 @@ def ask(body: AskBody):
             answer_text = make_llm_answer(prompt, system="You are a concise medical explainer.")
             unverified = True
 
-    # Adaptive follow-ups
+    # Adaptive follow-ups (type-scoped)
     pills = adaptive_followups(q, answer_text, selected_type)
 
     # Store assistant msg
