@@ -24,6 +24,8 @@ DATA_DIR = os.environ.get("DATA_DIR", "./data")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*").split(",")
 
 os.makedirs(DATA_DIR, exist_ok=True)
+# Ensure chroma subdir exists on first boot so persistence doesn’t error
+os.makedirs(os.path.join(DATA_DIR, "chroma"), exist_ok=True)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -40,7 +42,6 @@ collection = chroma_client.get_or_create_collection(
 )
 
 # ========= SHOULDER ARTHROSCOPY SUBTYPES & TAGGING =========
-# Feel free to tweak labels/keywords or add more synonyms.
 PROCEDURE_TYPES = {
     "General (All Types)": [],
     "Rotator Cuff Repair": ["rotator cuff", "supraspinatus", "infraspinatus", "subscapularis", "teres minor", "rc tear"],
@@ -53,7 +54,6 @@ PROCEDURE_TYPES = {
     "Capsular Release": ["capsular release", "adhesive capsulitis", "frozen shoulder", "arthroscopic release"],
     "Debridement/Diagnostic Only": ["debridement", "diagnostic arthroscopy", "synovectomy"],
 }
-
 PROCEDURE_KEYS = list(PROCEDURE_TYPES.keys())
 
 def classify_chunk(text: str) -> str:
@@ -125,7 +125,6 @@ def followup_pills_from_answer(answer: str) -> List[str]:
         "What pain control is typical?",
         "When do stitches come out?",
     ]
-    # Simple heuristic to keep it short and relevant
     return base[:4]
 
 # ========= FASTAPI =========
@@ -316,8 +315,8 @@ async function loadTypes() {{
   }});
   sel.addEventListener('change', () => {{
     SELECTED_TYPE = sel.value;
-    // inform user selection
-    addBot(`Filtering to “${SELECTED_TYPE}”. Ask a question or tap a pill.`);
+    // FIXED: avoid Python f-string seeing {{}} — no template literal with ${...}
+    addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
   }});
   SELECTED_TYPE = sel.value;
 }}
@@ -428,8 +427,12 @@ def get_types():
 async def ingest(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".docx"):
         return JSONResponse({"ok": False, "error": "Please upload a .docx file."}, status_code=400)
-    data = await file.read()
-    chunks = chunk_docx(data)
+    try:
+        data = await file.read()
+        chunks = chunk_docx(data)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Ingest failed: {type(e).__name__}: {e}"}, status_code=400)
+
     docs, ids, metas = [], [], []
     for i, ch in enumerate(chunks):
         subtype = classify_chunk(ch)
@@ -496,7 +499,7 @@ def ask(body: AskBody):
         metas = (res.get("metadatas") or [[]])[0]
         dists = (res.get("distances") or [[]])[0]
     except Exception as e:
-        docs, metas, dists = [], [], []
+        return {"answer": f"Search failed: {type(e).__name__}: {e}", "pills": [], "unverified": False}
 
     # Heuristic coverage check:
     # Consider "covered by clinic" if we have at least one chunk within a similarity distance threshold
