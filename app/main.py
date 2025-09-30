@@ -561,189 +561,23 @@ def widget_js():
 })();
 """.strip()
 
-# ----------------------------- PAGES -----------------------------
-
-APPLE_BLUE = "#007aff"
-
-def _base_css():
-    return f"""
-    :root {{
-      --bg: #ffffff; --text:#111; --muted:#6b7280; --border:#e5e7eb; --accent:{APPLE_BLUE};
-    }}
-    @media (prefers-color-scheme: dark) {{
-      :root {{ --bg:#0b0b0c; --text:#f5f5f7; --muted:#9aa1aa; --border:#1f2125; --accent:#4da3ff; }}
-    }}
-    * {{ box-sizing: border-box; }}
-    html, body {{ height:100%; }}
-    body {{
-      margin:0; background:var(--bg); color:var(--text);
-      font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Inter,Roboto,system-ui;
-    }}
-    a {{ color:inherit; text-decoration:none; }}
-    .shell {{ max-width:1100px; margin:0 auto; padding:28px 20px 64px; }}
-    .nav {{
-      display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 0 24px;
-    }}
-    .logo {{ font-weight:800; letter-spacing:-.3px; font-size:20px; }}
-    .logo b {{ color:var(--accent); }}
-    .nav a.btn {{
-      padding:10px 14px; border:1px solid var(--border); border-radius:12px;
-      transition:all .15s ease; font-weight:600;
-    }}
-    .nav a.btn.primary {{ background:var(--accent); color:#fff; border-color:transparent; }}
-    .nav a.btn:hover {{ transform:translateY(-1px); }}
-    .hero {{
-      display:grid; grid-template-columns:1.1fr .9fr; gap:28px; align-items:center; padding:18px 0 18px;
-    }}
-    @media (max-width: 900px) {{ .hero {{ grid-template-columns:1fr; }} }}
-    .h1 {{
-      font-size:42px; line-height:1.08; font-weight:800; letter-spacing:-.6px; margin:0 0 12px;
-    }}
-    .sub {{ color:var(--muted); font-size:18px; line-height:1.5; max-width:46ch; }}
-    .cta-row {{ display:flex; gap:12px; align-items:center; margin-top:20px; }}
-    .btn-lg {{
-      padding:14px 18px; border-radius:14px; border:0; background:var(--accent); color:#fff; font-weight:700;
-      cursor:pointer; transition:transform .15s ease, opacity .15s ease;
-    }}
-    .btn-lg:hover {{ transform:translateY(-1px); opacity:.95; }}
-    .card {{
-      background:rgba(0,0,0,.03); border:1px solid var(--border); border-radius:16px; padding:18px;
-    }}
-    @media (prefers-color-scheme: dark) {{ .card {{ background:rgba(255,255,255,.04); }} }}
-
-    /* Login */
-    .login-wrap {{ max-width:480px; margin:48px auto 0; }}
-    .field {{ display:flex; flex-direction:column; gap:6px; margin:12px 0; }}
-    .label {{ font-size:14px; color:var(--muted); }}
-    .input {{
-      padding:12px 14px; border:1px solid var(--border); border-radius:12px; background:transparent; color:var(--text);
-      outline:none;
-    }}
-    .footnote {{ margin-top:14px; color:var(--muted); font-size:12px; }}
-
-    /* Chat page container (white, full bleed) */
-    .chat-shell {{ max-width:900px; margin:0 auto; padding:48px 20px 72px; }}
-    """
-
+# ===== Minimal home (unchanged from your version) =====
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return f"""<!doctype html>
+    return """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Patient Education — Home</title>
+  <title>PreDoc — Patient Education Chat</title>
   <meta name="color-scheme" content="light dark">
-  <style>{_base_css()}</style>
+  <style>body{margin:0;background:#f5f5f7}</style>
 </head>
 <body>
-  <div class="shell">
-    <div class="nav">
-      <div class="logo">Surgi<b>Chat</b></div>
-      <div>
-        <a class="btn" href="/login">Log in</a>
-        <a class="btn primary" href="/shoulder">Open Chat</a>
-      </div>
-    </div>
-
-    <section class="hero">
-      <div>
-        <h1 class="h1">Patient Education, before your visit.</h1>
-        <p class="sub">Upload clinic PDFs once. Patients ask natural questions and receive concise, clinic-aligned answers with friendly follow-up prompts — all in plain language.</p>
-        <div class="cta-row">
-          <a class="btn-lg" href="/login">Get started</a>
-          <a class="btn" href="/shoulder" style="border-radius:14px;border:1px solid var(--border);">Try the demo</a>
-        </div>
-      </div>
-      <div class="card">
-        <div style="height:320px; display:flex; align-items:center; justify-content:center; color:var(--muted);">
-          Chat preview area
-        </div>
-      </div>
-    </section>
-  </div>
-</body>
-</html>"""
-
-@app.get("/login", response_class=HTMLResponse)
-def login_page():
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Patient Education — Login</title>
-  <meta name="color-scheme" content="light dark">
-  <style>{_base_css()}</style>
-</head>
-<body>
-  <div class="shell">
-    <div class="nav">
-      <div class="logo">Surgi<b>Chat</b></div>
-      <div>
-        <a class="btn" href="/">Home</a>
-        <a class="btn primary" href="/shoulder">Open Chat</a>
-      </div>
-    </div>
-
-    <div class="login-wrap card">
-      <h2 style="margin:0 0 6px; font-size:24px; font-weight:800;">Welcome back</h2>
-      <p class="sub" style="font-size:15px; margin:0 0 10px;">Sign in to continue (UI only — no authentication performed).</p>
-
-      <form id="login-form">
-        <div class="field">
-          <label class="label" for="email">Email</label>
-          <input id="email" class="input" type="email" placeholder="you@example.com">
-        </div>
-        <div class="field">
-          <label class="label" for="password">Password</label>
-          <input id="password" class="input" type="password" placeholder="••••••••">
-        </div>
-        <button class="btn-lg" type="submit" style="width:100%;">Continue</button>
-        <div class="footnote">By continuing you agree to our terms. This is a demo — no data is stored.</div>
-      </form>
-    </div>
-  </div>
-
+  <div id="drqa-root"></div>
   <script>
-    // No real auth — just route to the chat page
-    document.getElementById('login-form').addEventListener('submit', function(ev){ 
-      ev.preventDefault(); 
-      window.location.href = '/shoulder';
-    });
-  </script>
-</body>
-</html>"""
-
-@app.get("/shoulder", response_class=HTMLResponse)
-def shoulder_chat():
-    # This page mounts your existing widget.js and points it at the same API.
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Patient Education — Shoulder Arthroscopy</title>
-  <meta name="color-scheme" content="light dark">
-  <style>{_base_css()}</style>
-</head>
-<body>
-  <div class="shell" style="padding-bottom:0;">
-    <div class="nav" style="padding-bottom:0;">
-      <div class="logo">Surgi<b>Chat</b></div>
-      <div>
-        <a class="btn" href="/">Home</a>
-        <a class="btn" href="/login">Log in</a>
-      </div>
-    </div>
-  </div>
-
-  <div class="chat-shell">
-    <div id="drqa-root"></div>
-  </div>
-
-  <script>
-    // Configure your widget to use this server and shoulder topic
     window.DRQA_API_URL = location.origin;
     window.DRQA_TOPIC = "shoulder";
   </script>
-  <script src="/widget.js?v=17" defer></script>
+  <script src="/widget.js?v=16" defer></script>
 </body>
 </html>"""
