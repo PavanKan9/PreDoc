@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -10,11 +10,10 @@ from openai import OpenAI
 import chromadb
 from chromadb.utils import embedding_functions
 
-# ---- Project-local utilities (keep as-is in your repo) ----
+# ---- Project-local utilities (safe fallback) ----
 try:
     from .safety import triage_flags
 except Exception:
-    # Fallback no-op if running stand-alone
     def triage_flags(text: str) -> Dict[str, Any]:
         return {"blocked": False, "reasons": []}
 
@@ -24,7 +23,6 @@ DATA_DIR = os.environ.get("DATA_DIR", "./data")
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*").split(",")
 
 os.makedirs(DATA_DIR, exist_ok=True)
-# Ensure chroma subdir exists on first boot so persistence doesn’t error
 os.makedirs(os.path.join(DATA_DIR, "chroma"), exist_ok=True)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -41,7 +39,7 @@ collection = chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"}
 )
 
-# ========= SHOULDER ARTHROSCOPY SUBTYPES & TAGGING =========
+# ========= SHOULDER ARTHROSCOPY SUBTYPES =========
 PROCEDURE_TYPES = {
     "General (All Types)": [],
     "Rotator Cuff Repair": ["rotator cuff", "supraspinatus", "infraspinatus", "subscapularis", "teres minor", "rc tear"],
@@ -55,6 +53,70 @@ PROCEDURE_TYPES = {
     "Debridement/Diagnostic Only": ["debridement", "diagnostic arthroscopy", "synovectomy"],
 }
 PROCEDURE_KEYS = list(PROCEDURE_TYPES.keys())
+
+# Default, type-specific starter pills (first view after selecting a type)
+PROCEDURE_PILLS: Dict[str, List[str]] = {
+    "General (All Types)": [
+        "When is shoulder arthroscopy recommended?",
+        "What are the risks & complications?",
+        "How long is recovery?",
+        "What does PT look like after surgery?",
+    ],
+    "Rotator Cuff Repair": [
+        "When is rotator cuff repair recommended?",
+        "How long is recovery for rotator cuff repair?",
+        "When can I start PT after rotator cuff repair?",
+        "What are risks of rotator cuff repair?",
+    ],
+    "SLAP Repair": [
+        "When is SLAP repair recommended?",
+        "How long is recovery for SLAP repair?",
+        "What are early rehab precautions after SLAP repair?",
+        "What are the risks of SLAP repair?",
+    ],
+    "Bankart (Anterior Labrum) Repair": [
+        "When is Bankart repair recommended?",
+        "How long is recovery for Bankart repair?",
+        "What instability precautions after Bankart repair?",
+        "What are the risks of Bankart repair?",
+    ],
+    "Posterior Labrum Repair": [
+        "When is posterior labrum repair recommended?",
+        "How long is recovery for posterior labrum repair?",
+        "What motions should I avoid early after posterior repair?",
+        "What are the risks of posterior labrum repair?",
+    ],
+    "Biceps Tenodesis/Tenotomy": [
+        "When is biceps tenodesis/tenotomy recommended?",
+        "How long is recovery for biceps tenodesis/tenotomy?",
+        "What are lifting precautions after tenodesis/tenotomy?",
+        "What are the risks of tenodesis/tenotomy?",
+    ],
+    "Subacromial Decompression (SAD)": [
+        "When is subacromial decompression recommended?",
+        "How long is recovery for SAD?",
+        "When can I return to work after SAD?",
+        "What are the risks of SAD?",
+    ],
+    "Distal Clavicle Excision": [
+        "When is distal clavicle excision recommended?",
+        "How long is recovery for DCE?",
+        "When can I bench press after DCE?",
+        "What are the risks of DCE?",
+    ],
+    "Capsular Release": [
+        "When is capsular release recommended?",
+        "How long is recovery for capsular release?",
+        "What is the PT plan after capsular release?",
+        "What are the risks of capsular release?",
+    ],
+    "Debridement/Diagnostic Only": [
+        "When is arthroscopic debridement recommended?",
+        "How long is recovery after debridement?",
+        "What can I do the first two weeks after debridement?",
+        "What are the risks of debridement?",
+    ],
+}
 
 def classify_chunk(text: str) -> str:
     t = text.lower()
@@ -71,65 +133,88 @@ def classify_chunk(text: str) -> str:
 
 # ========= HELPERS =========
 def chunk_docx(file_bytes: bytes) -> List[str]:
-    # Minimal, fast chunker for .docx text
     try:
-        import docx  # python-docx
+        import docx
     except ImportError:
         raise RuntimeError("python-docx is required. pip install python-docx")
-
     doc = docx.Document(io.BytesIO(file_bytes))
     paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     text = "\n".join(paras)
-    # Chunk by ~1000 chars with overlap
     chunks, size, overlap = [], 1000, 150
     i = 0
     while i < len(text):
-        chunk = text[i:i+size]
-        chunks.append(chunk)
+        chunks.append(text[i:i+size])
         i += size - overlap
     return chunks
 
 def make_llm_answer(prompt: str, system: str = "You are a concise medical explainer.") -> str:
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
-        ],
+        messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
         temperature=0.2,
         max_tokens=300,
     )
     return resp.choices[0].message.content.strip()
 
 def summarize_to_2_or_3_sentences(text: str) -> str:
-    prompt = (
-        "Summarize the following answer into 2–3 sentences, patient-friendly, "
-        "without losing key specifics:\n\n" + text
+    return make_llm_answer(
+        "Summarize the answer into 2–3 patient-friendly sentences without losing key specifics:\n\n" + text,
+        system="You compress long answers into 2–3 clear sentences."
     )
-    return make_llm_answer(prompt, system="You compress long answers into 2–3 clear sentences.")
 
-def pills_for_intro() -> List[str]:
-    # Ensure first pill is the requested one.
-    return [
-        "When is it recommended?",
-        "What are the risks & complications?",
-        "What does recovery look like?",
-        "What is the PT plan after surgery?",
-    ]
+def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str]:
+    """
+    Lightweight adaptive logic:
+    - Looks at the last question and the produced answer
+    - Returns 4 concise, type-scoped follow-up questions
+    """
+    last = (last_q or "").lower()
+    base = PROCEDURE_PILLS.get(selected_type or "General (All Types)", PROCEDURE_PILLS["General (All Types)"])
 
-def followup_pills_from_answer(answer: str) -> List[str]:
-    # Keep pills as questions only (no content).
-    base = [
-        "Am I a good candidate?",
-        "How long before I can drive/work out?",
-        "What pain control is typical?",
-        "When do stitches come out?",
-    ]
+    # Heuristics based on common intents
+    if "recover" in last or "return" in last or "heal" in last:
+        return [
+            f"When can I return to work/sport after {selected_type.lower()}?",
+            "What milestones should I expect during rehab?",
+            "How is pain typically managed during recovery?",
+            "When do I transition from sling to full motion?",
+        ]
+    if "risk" in last or "complication" in last or "safe" in last:
+        return [
+            "How are risks minimized before and after surgery?",
+            "What signs should prompt me to call the clinic?",
+            "How common are re-injury or stiffness?",
+            "What follow-up visits will I have?",
+        ]
+    if "pt" in last or "therapy" in last or "exercise" in last:
+        return [
+            "What are the first-week exercises?",
+            "When can I start strengthening?",
+            "What motions should I avoid early on?",
+            "How often will PT sessions be?",
+        ]
+    if "pain" in last or "med" in last or "block" in last:
+        return [
+            "How long should I expect pain after surgery?",
+            "What non-opioid options are used?",
+            "When should I taper medications?",
+            "What red flags of uncontrolled pain should I watch for?",
+        ]
+
+    # If the answer text mentions timeframes or sling → recovery themed
+    if re.search(r"\b(weeks?|months?)\b", answer.lower()) or "sling" in answer.lower():
+        return [
+            "When do I start passive vs active motion?",
+            "When can I drive again?",
+            "When can I sleep without the sling?",
+            "What limits should I follow at work/school?",
+        ]
+
+    # Default: type-specific starters (kept concise)
     return base[:4]
 
-# ========= FASTAPI =========
+# ========= FASTAPI APP =========
 app = FastAPI(title="PreDoc - Shoulder Arthroscopy Chat")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS if ALLOW_ORIGINS != ["*"] else ["*"],
@@ -138,22 +223,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory sessions for "Previous Chats" (persist lightly if desired)
-SESSIONS: Dict[str, Dict[str, Any]] = {}  # {session_id: {"title": str, "messages": [..]}}
+# Simple in-memory sessions
+SESSIONS: Dict[str, Dict[str, Any]] = {}  # {id: {title, messages: [{role, content}], selected_type}}
 
 # ========= MODELS =========
 class AskBody(BaseModel):
     question: str
     session_id: Optional[str] = None
-    selected_type: Optional[str] = None  # must be one of PROCEDURE_KEYS or None
+    selected_type: Optional[str] = None
 
 # ========= ROUTES =========
-
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Full-screen UI with left sidebar (prev chats) and right chat. Apple-like clean.
-    # Includes subtype dropdown and 2x2 pill layout.
-    return HTMLResponse(content=f"""
+    # Cleaner, calmer visuals. Hero appears until a type is selected.
+    return HTMLResponse(f"""
 <!doctype html>
 <html lang="en">
 <head>
@@ -162,128 +245,129 @@ def home():
 <title>SurgiChat · Shoulder Arthroscopy</title>
 <style>
   :root {{
-    --bg: #ffffff;
-    --text: #0b0b0c;
-    --muted: #6b7280;
-    --accent: #0a84ff;       /* Apple-ish blue */
-    --accent-2: #ff7a18;     /* Orange for CTA/pills */
-    --border: #e5e7eb;
-    --sidebar-w: 20vw;       /* ~1/6 */
+    --bg:#fff; --text:#0b0b0c; --muted:#6b7280; --border:#ececec;
+    --accent:#0a84ff; --accent2:#ff7a18;
+    --sidebar-w: 18rem;
   }}
-  * {{ box-sizing: border-box; }}
+  * {{ box-sizing:border-box; }}
   body {{
-    margin: 0; padding: 0; background: var(--bg); color: var(--text);
-    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji;
+    margin:0; background:var(--bg); color:var(--text);
+    font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
   }}
   .app {{
-    display: grid; grid-template-columns: var(--sidebar-w) 1fr; height: 100vh; width: 100vw;
+    display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw;
   }}
   .sidebar {{
-    border-right: 1px solid var(--border); padding: 20px; overflow-y: auto;
+    border-right:1px solid var(--border); padding:16px 14px; overflow:auto;
   }}
-  .brand {{
-    display:flex; align-items:center; gap:10px; margin-bottom: 18px;
-  }}
-  .logo {{
-    width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(180deg,var(--accent), var(--accent-2));
-  }}
-  .brand h1 {{ font-size: 16px; font-weight: 700; margin:0; }}
+  .brand {{ display:flex; align-items:center; gap:10px; margin-bottom:12px; }}
+  .logo {{ width:26px; height:26px; border-radius:8px; background:linear-gradient(180deg,var(--accent),var(--accent2)); }}
+  .brand h1 {{ font-size:14px; font-weight:700; margin:0; letter-spacing:.2px; }}
   .new-chat {{
-    display:block; width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:12px;
-    background:#f9fafb; text-align:center; cursor:pointer; margin-bottom:12px;
+    width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:12px; background:#f8f8f8;
+    cursor:pointer; margin-bottom:12px;
   }}
-  .chat-list h2 {{
-    font-size: 12px; text-transform: uppercase; letter-spacing:.08em; color: var(--muted); margin: 14px 0 8px;
-  }}
-  .chat-item {{
-    padding:10px 8px; border-radius:10px; cursor:pointer;
-  }}
-  .chat-item:hover {{ background:#f3f4f6; }}
-  .main {{
-    display:flex; flex-direction:column; height:100%; width:100%;
-  }}
+  .sideh2 {{ font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:10px 0 6px; }}
+  .chat-item {{ padding:8px 8px; border-radius:10px; cursor:pointer; }}
+  .chat-item:hover {{ background:#f5f5f5; }}
+
+  .main {{ display:flex; flex-direction:column; min-width:0; }}
   .topbar {{
-    display:flex; align-items:center; justify-content:space-between;
-    padding: 18px 22px; border-bottom: 1px solid var(--border);
+    display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid var(--border);
   }}
-  .title {{ font-size: 18px; font-weight:700; letter-spacing:.2px; }}
-  .controls {{ display:flex; gap:12px; align-items:center; flex-wrap: wrap; }}
+  .title {{ font-size:16px; font-weight:700; letter-spacing:.2px; }}
+  .controls {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
+
   select, button {{
-    border:1px solid var(--border); border-radius:12px; padding:10px 12px; font-size:14px; background:#fff;
+    border:1px solid var(--border); border-radius:12px; padding:9px 12px; font-size:14px; background:#fff;
   }}
-  .content {{
-    flex:1; display:flex; flex-direction:column; overflow: hidden;
+
+  .content {{ flex:1; display:flex; flex-direction:column; overflow:hidden; }}
+
+  /* HERO (initial state) */
+  .hero {{
+    flex:1; display:flex; align-items:center; justify-content:center; text-align:center; padding:40px 20px;
   }}
-  .intro {{
-    padding: 18px 22px; border-bottom: 1px solid var(--border);
+  .hero-inner {{ max-width:780px; }}
+  .hero h2 {{
+    font-size: clamp(28px, 4vw, 44px);
+    line-height:1.1; margin:0 0 16px; font-weight:800; letter-spacing:-0.02em;
   }}
-  .pills {{
-    display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:10px; max-width:720px;
+  .hero p {{ color:var(--muted); margin:0 0 20px; font-size:16px; }}
+  .hero .selector {{
+    display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap;
   }}
+  .hero label {{ color:#111; font-weight:600; }}
+  .hero select {{ min-width:280px; }}
+
+  /* INTRO + PILLS (after type chosen) */
+  .intro {{ padding:16px 18px; border-bottom:1px solid var(--border); display:none; }}
+  .intro h3 {{ margin:0 0 10px; font-size:16px; font-weight:700; }}
+  .pills {{ display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:10px; max-width:760px; }}
+  @media (min-width: 1100px) {{ .pills {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }} }}
   .pill {{
-    padding:10px 12px; border:1px solid var(--border); border-radius:999px; cursor:pointer;
-    background: #fff; text-align:center; font-size:14px;
+    padding:10px 12px; border:1px solid var(--border); border-radius:999px; cursor:pointer; background:#fff; text-align:center; font-size:14px;
   }}
-  .pill.cta {{ border-color: var(--accent-2); color: var(--accent-2); }}
-  @media (min-width: 1100px) {{
-    .pills {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
-  }}
-  .chat-area {{ flex:1; overflow-y:auto; padding: 18px 22px; }}
-  .bubble {{
-    max-width: 800px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0;
-    line-height:1.45;
-  }}
-  .bot {{ background:#f9fafb; }}
-  .user {{ background:#ffffff; margin-left: auto; border-color:#d1d5db; }}
-  .composer {{
-    display:flex; gap:10px; padding: 14px 22px; border-top: 1px solid var(--border);
-  }}
-  .composer input {{
-    flex:1; border:1px solid var(--border); border-radius:12px; padding:12px; font-size:15px;
-  }}
-  .composer button {{
-    background: var(--accent); color:white; border:none; padding: 12px 16px; border-radius:12px; cursor:pointer;
-  }}
-  .disclaimer {{
-    color: var(--muted); font-size: 12px; margin-top:8px;
-  }}
+  .pill.cta {{ border-color:var(--accent2); color:var(--accent2); }}
+
+  .chat-area {{ flex:1; overflow:auto; padding: 16px 18px; }}
+  .bubble {{ max-width:820px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0; line-height:1.45; }}
+  .bot {{ background:#fafafa; }}
+  .user {{ background:#fff; margin-left:auto; border-color:#ddd; }}
+
+  .composer {{ display:flex; gap:10px; padding: 12px 18px; border-top:1px solid var(--border); }}
+  .composer input {{ flex:1; border:1px solid var(--border); border-radius:12px; padding:12px; font-size:15px; }}
+  .composer button {{ background:var(--accent); color:#fff; border:none; padding: 12px 16px; border-radius:12px; cursor:pointer; }}
+
+  .disclaimer {{ color:var(--muted); font-size:12px; margin-top:8px; }}
+
   .spinner {{
-    width:18px; height:18px; border-radius:50%; border:3px solid #e5e7eb; border-top-color: var(--accent);
-    animation: spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px;
+    width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color:var(--accent);
+    animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px;
   }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
 </style>
 </head>
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="brand">
-      <div class="logo"></div>
-      <h1>SurgiChat</h1>
-    </div>
+    <div class="brand"><div class="logo"></div><h1>SurgiChat</h1></div>
     <button class="new-chat" onclick="newChat()">+ New chat</button>
-    <div class="chat-list">
-      <h2>Previous chats</h2>
-      <div id="chats"></div>
-    </div>
+    <div class="sideh2">Previous chats</div>
+    <div id="chats"></div>
   </aside>
 
   <main class="main">
     <div class="topbar">
       <div class="title">Patient Education · Shoulder Arthroscopy</div>
-      <div class="controls">
-        <label for="type">What type of Shoulder Arthroscopy</label>
+      <div class="controls" id="controlBar" style="display:none">
+        <label for="type">Type</label>
         <select id="type"></select>
       </div>
     </div>
 
     <div class="content">
-      <div class="intro" id="intro">
-        <div style="font-weight:600; margin-bottom:8px;">Quick questions</div>
+      <!-- HERO (initial prompt to select a type) -->
+      <section class="hero" id="hero">
+        <div class="hero-inner">
+          <h2>Welcome! Select the type of surgery below:</h2>
+          <p>Choose your specific shoulder arthroscopy to tailor answers and quick questions.</p>
+          <div class="selector">
+            <label for="typeHero">What type of Shoulder Arthroscopy</label>
+            <select id="typeHero"></select>
+          </div>
+        </div>
+      </section>
+
+      <!-- INTRO (quick pills appear after type selection) -->
+      <section class="intro" id="intro">
+        <h3 id="introTitle">Quick questions</h3>
         <div class="pills" id="pills"></div>
         <div class="disclaimer">Educational use only. This does not replace medical advice.</div>
-      </div>
+      </section>
+
       <div class="chat-area" id="chat"></div>
+
       <div class="composer">
         <input id="q" placeholder="Ask about your procedure…" onkeydown="if(event.key==='Enter') ask()"/>
         <button onclick="ask()">Send</button>
@@ -297,107 +381,125 @@ let SESSION_ID = null;
 let SELECTED_TYPE = null;
 
 async function boot() {{
-  await loadTypes();
+  // Load types into both hero dropdown and topbar compact dropdown
+  const types = await fetch('/types').then(r=>r.json()).then(d=>d.types || []);
+  const selHero = document.getElementById('typeHero');
+  const selTop  = document.getElementById('type');
+  [selHero, selTop].forEach(sel => {{
+    sel.innerHTML = '';
+    types.forEach(t => {{
+      const opt = document.createElement('option'); opt.value=t; opt.textContent=t; sel.appendChild(opt);
+    }});
+  }});
+  // Hero change selects the type (initial state)
+  selHero.addEventListener('change', () => handleTypeChange(selHero.value, true));
+  // Topbar change adjusts selection after we're in chat state
+  selTop.addEventListener('change', () => handleTypeChange(selTop.value, false));
+
   await listSessions();
-  newChat(true);
-  renderIntroPills();
+  await newChat(true);
 }}
-async function loadTypes() {{
-  const res = await fetch('/types');
-  const data = await res.json();
-  const sel = document.getElementById('type');
-  sel.innerHTML = '';
-  data.types.forEach(t => {{
-    const opt = document.createElement('option');
-    opt.value = t;
-    opt.textContent = t;
-    sel.appendChild(opt);
-  }});
-  sel.addEventListener('change', () => {{
-    SELECTED_TYPE = sel.value;
-    // FIXED: avoid Python f-string seeing {{}} — no template literal with ${...}
-    addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
-  }});
-  SELECTED_TYPE = sel.value;
+function handleTypeChange(value, fromHero) {{
+  SELECTED_TYPE = value;
+  // Sync both dropdowns
+  document.getElementById('typeHero').value = value;
+  document.getElementById('type').value = value;
+
+  // Transition: hide hero, show intro + control bar
+  document.getElementById('hero').style.display = 'none';
+  document.getElementById('intro').style.display = 'block';
+  document.getElementById('controlBar').style.display = 'flex';
+
+  // Render type-specific pills
+  renderTypePills();
+
+  // Let user know scope
+  addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
+}}
+function renderTypePills() {{
+  const el = document.getElementById('pills');
+  el.innerHTML = '';
+  const title = document.getElementById('introTitle');
+  title.textContent = 'Quick questions · ' + SELECTED_TYPE;
+
+  // Ask server for defaults (keeps logic in one place if you change it later)
+  fetch('/pills?type=' + encodeURIComponent(SELECTED_TYPE))
+    .then(r=>r.json())
+    .then(data => {{
+      const pills = data.pills || [];
+      pills.forEach((label, i) => {{
+        const b = document.createElement('button');
+        b.className = 'pill' + (i===0 ? ' cta' : '');
+        b.textContent = label;
+        b.onclick = () => {{
+          document.getElementById('q').value = label;
+          ask();
+        }};
+        el.appendChild(b);
+      }});
+    }});
 }}
 async function listSessions() {{
-  const res = await fetch('/sessions');
-  const data = await res.json();
-  const el = document.getElementById('chats');
-  el.innerHTML = '';
+  const data = await fetch('/sessions').then(r=>r.json());
+  const el = document.getElementById('chats'); el.innerHTML='';
   data.sessions.forEach(s => {{
     const d = document.createElement('div');
-    d.className = 'chat-item';
+    d.className='chat-item';
     d.textContent = s.title || 'Untitled chat';
     d.onclick = () => loadSession(s.id);
     el.appendChild(d);
   }});
 }}
 async function newChat(silent=false) {{
-  const res = await fetch('/sessions/new', {{method:'POST'}});
-  const data = await res.json();
+  const data = await fetch('/sessions/new', {{method:'POST'}}).then(r=>r.json());
   SESSION_ID = data.session_id;
   if(!silent) addBot('New chat started. Select a procedure type or ask a question.');
   await listSessions();
 }}
 async function loadSession(id) {{
-  const res = await fetch('/sessions/' + id);
-  const data = await res.json();
+  const data = await fetch('/sessions/'+id).then(r=>r.json());
   SESSION_ID = id;
-  const chat = document.getElementById('chat');
-  chat.innerHTML = '';
+  const chat = document.getElementById('chat'); chat.innerHTML='';
   data.messages.forEach(m => {{
     if(m.role==='user') addUser(m.content); else addBot(m.content);
   }});
 }}
 function addUser(text) {{
-  const d = document.createElement('div'); d.className = 'bubble user'; d.textContent = text;
-  document.getElementById('chat').appendChild(d);
-  scrollBottom();
+  const d = document.createElement('div'); d.className='bubble user'; d.textContent=text;
+  document.getElementById('chat').appendChild(d); scrollBottom();
 }}
 function addBot(htmlText) {{
-  const d = document.createElement('div'); d.className = 'bubble bot'; d.innerHTML = htmlText;
-  document.getElementById('chat').appendChild(d);
-  scrollBottom();
+  const d = document.createElement('div'); d.className='bubble bot'; d.innerHTML=htmlText;
+  document.getElementById('chat').appendChild(d); scrollBottom();
 }}
 function spinner() {{
-  const d = document.createElement('div'); d.className='bubble bot'; d.innerHTML='Thinking <span class="spinner"></span>';
-  document.getElementById('chat').appendChild(d);
-  scrollBottom();
-  return d;
+  const d = document.createElement('div'); d.className='bubble bot';
+  d.innerHTML='Thinking <span class="spinner"></span>';
+  document.getElementById('chat').appendChild(d); scrollBottom(); return d;
 }}
 function scrollBottom() {{
-  const el = document.getElementById('chat');
-  el.scrollTop = el.scrollHeight;
-}}
-function renderIntroPills() {{
-  const el = document.getElementById('pills');
-  el.innerHTML = '';
-  const pills = {json.dumps(pills_for_intro())};
-  pills.forEach((label, i) => {{
-    const b = document.createElement('button');
-    b.className = 'pill' + (i===0 ? ' cta' : '');
-    b.textContent = label;
-    b.onclick = () => {{
-      document.getElementById('q').value = (i===0 ? 'When is shoulder arthroscopy recommended?' : label);
-      ask();
-    }};
-    el.appendChild(b);
-  }});
+  const el = document.getElementById('chat'); el.scrollTop = el.scrollHeight;
 }}
 async function ask() {{
   const q = document.getElementById('q').value.trim();
   if(!q) return;
-  addUser(q);
-  document.getElementById('q').value='';
+  if(!SELECTED_TYPE) {{
+    addBot('Please select a surgery type first.');
+    return;
+  }}
+  addUser(q); document.getElementById('q').value='';
   const spin = spinner();
   const body = {{question: q, session_id: SESSION_ID, selected_type: SELECTED_TYPE}};
-  const res = await fetch('/ask', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
-  const data = await res.json();
+  const data = await fetch('/ask', {{
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify(body)
+  }}).then(r=>r.json());
   spin.remove();
   addBot(data.answer);
+
+  // Adaptive pills (change after each answer)
   if(data.pills && data.pills.length) {{
-    // show 2x2 pills under the bot message
     const wrap = document.createElement('div'); wrap.style.marginTop='6px';
     const grid = document.createElement('div'); grid.className='pills';
     data.pills.forEach(label => {{
@@ -411,8 +513,13 @@ async function ask() {{
   if(data.unverified) {{
     addBot('<div class="disclaimer">This information is not verified by the clinic; please contact your provider with questions.</div>');
   }}
+
+  // Also refresh the intro pills to keep them type-scoped and tidy
+  renderTypePills();
   await listSessions();
 }}
+
+// Boot after DOM ready
 boot();
 </script>
 </body>
@@ -422,6 +529,12 @@ boot();
 @app.get("/types")
 def get_types():
     return {"types": PROCEDURE_KEYS}
+
+@app.get("/pills")
+def get_pills(type: str):
+    # Return the starter pills for a given type
+    pills = PROCEDURE_PILLS.get(type, PROCEDURE_PILLS["General (All Types)"])
+    return {"pills": pills[:4]}
 
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...)):
@@ -445,23 +558,34 @@ async def ingest(file: UploadFile = File(...)):
 
 @app.get("/sessions")
 def sessions():
-    # Return id + title only
-    out = [{"id": k, "title": v.get("title") or (v["messages"][0]["content"][:40] + "…"
-            if v.get("messages") else "New chat")} for k, v in SESSIONS.items()]
-    # newest first
+    out = []
+    for k, v in SESSIONS.items():
+        title = v.get("title") or ("New chat")
+        if v.get("messages"):
+            first = v["messages"][0]["content"]
+            title = v.get("title") or (first[:40] + "…")
+        out.append({"id": k, "title": title})
     out.sort(key=lambda x: x["id"], reverse=True)
     return {"sessions": out}
 
 @app.post("/sessions/new")
 def new_session():
     sid = uuid.uuid4().hex[:10]
-    SESSIONS[sid] = {"title": "New chat", "messages": []}
+    SESSIONS[sid] = {"title": "New chat", "messages": [], "selected_type": None}
     return {"session_id": sid}
 
 @app.get("/sessions/{sid}")
 def read_session(sid: str):
     sess = SESSIONS.get(sid, {"messages": []})
     return {"messages": sess["messages"]}
+
+class AskBodyModel(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+    selected_type: Optional[str] = None
+
+# Keep legacy model for compatibility with earlier frontends
+AskBody = AskBodyModel
 
 @app.post("/ask")
 def ask(body: AskBody):
@@ -473,19 +597,19 @@ def ask(body: AskBody):
     if safety.get("blocked"):
         return {"answer": "I can’t help with that request.", "pills": [], "unverified": False}
 
-    # Store session/user msg
     sid = body.session_id or uuid.uuid4().hex[:10]
     if sid not in SESSIONS:
         SESSIONS[sid] = {"title": "New chat", "messages": []}
     SESSIONS[sid]["messages"].append({"role": "user", "content": q})
     if not SESSIONS[sid].get("title") or SESSIONS[sid]["title"] == "New chat":
         SESSIONS[sid]["title"] = q[:60]
+    selected_type = body.selected_type or "General (All Types)"
+    SESSIONS[sid]["selected_type"] = selected_type
 
     # Build Chroma filter by selected type
     where = {}
-    selected = body.selected_type
-    if selected and selected in PROCEDURE_KEYS and selected != "General (All Types)":
-        where = {"type": selected}
+    if selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
+        where = {"type": selected_type}
 
     # Retrieve
     try:
@@ -496,78 +620,62 @@ def ask(body: AskBody):
             include=["documents", "metadatas", "distances"]
         )
         docs = (res.get("documents") or [[]])[0]
-        metas = (res.get("metadatas") or [[]])[0]
         dists = (res.get("distances") or [[]])[0]
     except Exception as e:
         return {"answer": f"Search failed: {type(e).__name__}: {e}", "pills": [], "unverified": False}
 
-    # Heuristic coverage check:
-    # Consider "covered by clinic" if we have at least one chunk within a similarity distance threshold
-    covered = False
-    threshold = 0.2  # cosine distance; tweak as needed
-    if dists:
-        best = min(dists)
-        covered = best <= threshold
+    # Coverage check (cosine distance threshold)
+    covered = bool(dists and min(dists) <= 0.2)
 
-    answer_text = ""
+    # Build answer
     unverified = False
-
     if covered and docs:
-        # Compose a grounded answer from top 3 chunks
-        context = "\n\n".join(docs[:3])
+        ctx = "\n\n".join(docs[:3])
         prompt = (
-            "You are answering based ONLY on the provided clinic document context.\n"
-            "Write a clear, patient-friendly answer to the user question.\n"
-            "If the question is 'When is shoulder arthroscopy recommended?', explain typical indications.\n"
-            "Do NOT add external facts.\n\n"
-            f"Question: {q}\n\nContext:\n{context}\n\nAnswer:"
+            "Answer ONLY using the clinic document context below. "
+            f"Keep your answer scoped to this procedure type: {selected_type}. "
+            "Write in patient-friendly language. No external facts.\n\n"
+            f"Question: {q}\n\nContext:\n{ctx}\n\nAnswer:"
         )
         raw = make_llm_answer(prompt, system="You are a careful medical educator.")
         answer_text = summarize_to_2_or_3_sentences(raw)
-        unverified = False
     else:
-        # External fallback (unverified) ONLY if nowhere in doc
         prompt = (
-            "The clinic document did not cover this. Provide a short, patient-friendly answer "
-            "about shoulder arthroscopy based on general medical knowledge. Be accurate but concise."
-            f"\n\nQuestion: {q}\n\nAnswer:"
+            f"The clinic document did not cover this clearly for {selected_type}. "
+            "Provide a short, patient-friendly answer based on general medical knowledge. "
+            "Be accurate but concise.\n\n"
+            f"Question: {q}\n\nAnswer:"
         )
         raw = make_llm_answer(prompt, system="You are a careful medical educator.")
         answer_text = summarize_to_2_or_3_sentences(raw)
         unverified = True
 
-    # Special handling for the intro pill (force a crisp, indications-focused answer)
-    if re.search(r"\bwhen\s+is\s+(a\s+)?shoulder\s+arthroscopy\s+recommended\??", q.lower()):
-        # Prefer doc, but if not covered, provide general indications and mark as appropriate.
+    # Special handling for recommendation questions
+    if re.search(r"\bwhen\s+is\s+(a\s+)?(shoulder\s+)?(arthroscopy|repair|decompression|tenodesis|release|excision)\s+recommended\??", q.lower()):
         if covered and docs:
             ctx = "\n\n".join(docs[:3])
             prompt = (
-                "Using ONLY the context, list the common indications for shoulder arthroscopy "
-                "(rotator cuff tears, labral tears/instability, impingement, biceps tendon pathology, etc.). "
-                "Then compress to 2–3 sentences for patients. No external info.\n\n"
+                f"Using ONLY the context, list common indications for {selected_type} "
+                "and compress to 2–3 sentences for patients. No external info.\n\n"
                 f"Context:\n{ctx}\n\n2–3 sentence answer:"
             )
             answer_text = make_llm_answer(prompt, system="You are a concise medical explainer.")
             unverified = False
         else:
             prompt = (
-                "List the common indications for shoulder arthroscopy in 2–3 sentences for patients. "
+                f"List the common indications for {selected_type} in 2–3 sentences for patients. "
                 "Keep it neutral and high-level."
             )
             answer_text = make_llm_answer(prompt, system="You are a concise medical explainer.")
             unverified = True
 
-    # Build pills (questions only)
-    pills = followup_pills_from_answer(answer_text)
-
-    html_answer = answer_text
-    if unverified:
-        html_answer += ""
+    # Adaptive follow-ups (type-scoped, based on last q/answer)
+    pills = adaptive_followups(q, answer_text, selected_type)
 
     # Store assistant msg
-    SESSIONS[sid]["messages"].append({"role": "assistant", "content": html_answer})
+    SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
 
-    return {"answer": html_answer, "pills": pills, "unverified": unverified, "session_id": sid}
+    return {"answer": answer_text, "pills": pills, "unverified": unverified, "session_id": sid}
 
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
