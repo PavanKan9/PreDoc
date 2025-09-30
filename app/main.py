@@ -54,7 +54,7 @@ PROCEDURE_TYPES = {
 }
 PROCEDURE_KEYS = list(PROCEDURE_TYPES.keys())
 
-# Default, type-specific starter pills
+# Type-specific starter pills
 PROCEDURE_PILLS: Dict[str, List[str]] = {
     "General (All Types)": [
         "What is shoulder arthroscopy?",
@@ -152,7 +152,7 @@ def make_llm_answer(prompt: str, system: str = "You are a concise medical explai
         model="gpt-4o-mini",
         messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
         temperature=0.2,
-        max_tokens=300,
+        max_tokens=320,
     )
     return resp.choices[0].message.content.strip()
 
@@ -202,7 +202,7 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
         ]
     return base[:4]
 
-def likely_covered(question: str, docs: List[str], dists: List[float], dist_thresh: float = 0.33) -> bool:
+def likely_covered(question: str, docs: List[str], dists: List[float], dist_thresh: float = 0.35) -> bool:
     # 1) similarity threshold; 2) keyword overlap heuristic to capture paraphrases
     if not dists or not docs:
         return False
@@ -237,7 +237,7 @@ class AskBody(BaseModel):
 # ========= ROUTES =========
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Homescreen hero (Welcome + dropdown) -> after selection, switch into the Chat UI styled like your screenshot.
+    # Homescreen hero (Welcome + dropdown with Apple-like orange accent) -> Chat UI matching your layout.
     return HTMLResponse(f"""
 <!doctype html>
 <html lang="en">
@@ -249,7 +249,7 @@ def home():
   :root {{
     --bg:#fff; --text:#0b0b0c; --muted:#6b7280; --border:#eaeaea;
     --chip:#f6f6f6; --chip-border:#d9d9d9; --pill-border:#dbdbdb;
-    --accent:#0a84ff; --orange:#ff7a18;
+    --accent:#0a84ff; --orange:#ff7a18; --orange-soft:#ffe8d6;
     --sidebar-w: 15rem;
   }}
   * {{ box-sizing:border-box; }}
@@ -261,7 +261,11 @@ def home():
 
   /* Sidebar */
   .sidebar {{ border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }}
-  .side-title {{ font-size:13px; font-weight:600; color:#333; margin-bottom:8px; }}
+  .new-chat {{
+    display:block; width:100%; padding:10px 12px; margin-bottom:14px;
+    border:1px solid var(--border); border-radius:12px; background:#fff; cursor:pointer; font-weight:600;
+  }}
+  .side-title {{ font-size:13px; font-weight:600; color:#333; margin:6px 0 8px; }}
   .skeleton {{ height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%; }}
   .skeleton:nth-child(2) {{ width:70%; }} .skeleton:nth-child(3) {{ width:60%; }}
 
@@ -271,9 +275,15 @@ def home():
   /* HERO */
   .hero {{ flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }}
   .hero-inner {{ text-align:center; max-width:820px; }}
+  .hero .badge {{
+    display:inline-block; padding:6px 12px; border-radius:999px; background:var(--orange-soft); color:#9a4b00;
+    font-weight:700; font-size:12px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:14px;
+  }}
   .hero h1 {{
     font-size: clamp(30px, 4.5vw, 46px);
-    line-height:1.08; margin:0 0 16px; font-weight:800; letter-spacing:-0.02em;
+    line-height:1.08; margin:0 0 10px; font-weight:800; letter-spacing:-0.02em;
+    background: linear-gradient(90deg, var(--text), #333 60%, var(--orange));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
   }}
   .hero p {{ color:var(--muted); margin:0 0 22px; font-size:16px; }}
   .hero .selector {{ display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }}
@@ -329,6 +339,7 @@ def home():
 <body>
 <div class="app">
   <aside class="sidebar">
+    <button class="new-chat" onclick="newChat()">+ New chat</button>
     <div class="side-title">Previous Chats</div>
     <div id="chats"></div>
     <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
@@ -338,6 +349,7 @@ def home():
     <!-- HERO (homescreen) -->
     <section class="hero" id="hero">
       <div class="hero-inner">
+        <div class="badge">Shoulder</div>
         <h1>Welcome! Select the type of surgery below:</h1>
         <p>Choose your specific shoulder arthroscopy to tailor answers and quick questions.</p>
         <div class="selector">
@@ -347,7 +359,7 @@ def home():
       </div>
     </section>
 
-    <!-- CHAT VIEW (shown after selection) -->
+    <!-- CHAT VIEW (after selection) -->
     <div class="topbar" id="topbar">
       <div class="title">Patient Education</div>
       <div class="topic-chip" id="topicChip" onclick="toggleTopicPanel()">
@@ -378,20 +390,22 @@ def home():
 let SESSION_ID = null;
 let SELECTED_TYPE = null;
 
-function toggleTopicPanel() {{
+function toggleTopicPanel() {
   const p = document.getElementById('topicPanel');
   p.style.display = (p.style.display === 'block') ? 'none' : 'block';
-}}
+}
 
-async function boot() {{
+async function boot() {
   // Populate both dropdowns
   const types = await fetch('/types').then(r=>r.json()).then(d=>d.types||[]);
   const selHero = document.getElementById('typeHero');
   const selTop  = document.getElementById('typeSelect');
-  [selHero, selTop].forEach(sel => {{
+  [selHero, selTop].forEach(sel => {
     sel.innerHTML='';
-    types.forEach(t=>{{ const o=document.createElement('option'); o.value=t; o.textContent=t; sel.appendChild(o); }});
-  }});
+    types.forEach(t=>{
+      const o=document.createElement('option'); o.value=t; o.textContent=t; sel.appendChild(o);
+    });
+  });
   selHero.value = "General (All Types)";
 
   selHero.addEventListener('change', () => handleTypeChange(selHero.value, true));
@@ -399,9 +413,9 @@ async function boot() {{
 
   await listSessions();
   await newChat(true);
-}}
+}
 
-function handleTypeChange(value, fromHero) {{
+function handleTypeChange(value, fromHero) {
   SELECTED_TYPE = value;
   // Sync dropdowns + chip label
   document.getElementById('typeHero').value = value;
@@ -414,7 +428,7 @@ function handleTypeChange(value, fromHero) {{
   document.getElementById('chatContent').style.display = 'flex';
   document.getElementById('topicPanel').style.display = 'none';
 
-  // Clear chat area for a fresh start on new type (optional)
+  // Fresh start on new type
   document.getElementById('chat').innerHTML = '';
 
   // Render type-scoped starter pills
@@ -422,93 +436,92 @@ function handleTypeChange(value, fromHero) {{
 
   // Inform scope
   addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
-}}
+}
 
-function renderTypePills() {{
+function renderTypePills() {
   fetch('/pills?type=' + encodeURIComponent(SELECTED_TYPE))
     .then(r=>r.json())
-    .then(data => {{
+    .then(data => {
       const pills = data.pills || [];
       const el = document.getElementById('pills'); el.innerHTML='';
-      pills.forEach(label => {{
+      pills.forEach(label => {
         const b = document.createElement('button'); b.className='pill'; b.textContent=label;
-        b.onclick = () => {{ document.getElementById('q').value = label; ask(); }};
+        b.onclick = () => { document.getElementById('q').value = label; ask(); };
         el.appendChild(b);
-      }});
-    }});
-}}
+      });
+    });
+}
 
-async function listSessions() {{
+async function listSessions() {
   const data = await fetch('/sessions').then(r=>r.json());
   const el = document.getElementById('chats'); el.innerHTML='';
-  data.sessions.forEach(s => {{
+  data.sessions.forEach(s => {
     const d = document.createElement('div'); d.style.cursor='pointer'; d.style.padding='6px 2px';
     d.textContent = s.title || 'Untitled chat';
     d.onclick = () => loadSession(s.id);
     el.appendChild(d);
-  }});
-}}
+  });
+}
 
-async function newChat(silent=false) {{
-  const data = await fetch('/sessions/new', {{method:'POST'}}).then(r=>r.json());
+async function newChat(silent=false) {
+  const data = await fetch('/sessions/new', {method:'POST'}).then(r=>r.json());
   SESSION_ID = data.session_id;
   if(!silent) addBot('New chat started. Select a surgery type to begin.');
   await listSessions();
-}}
+}
 
-async function loadSession(id) {{
+async function loadSession(id) {
   const data = await fetch('/sessions/'+id).then(r=>r.json());
   SESSION_ID = id;
   const chat = document.getElementById('chat'); chat.innerHTML='';
-  data.messages.forEach(m => {{ if(m.role==='user') addUser(m.content); else addBot(m.content); }});
-}}
+  data.messages.forEach(m => { if(m.role==='user') addUser(m.content); else addBot(m.content); });
+}
 
-function addUser(text) {{
+function addUser(text) {
   const d = document.createElement('div'); d.className='bubble user'; d.textContent=text;
   document.getElementById('chat').appendChild(d); scrollBottom();
-}}
-function addBot(htmlText) {{
+}
+function addBot(htmlText) {
   const d = document.createElement('div'); d.className='bubble bot'; d.innerHTML=htmlText;
   document.getElementById('chat').appendChild(d); scrollBottom();
-}}
-function spinner() {{
+}
+function spinner() {
   const d = document.createElement('div'); d.className='bubble bot';
   d.innerHTML='Thinking <span class="spinner"></span>';
   document.getElementById('chat').appendChild(d); scrollBottom(); return d;
-}}
-function scrollBottom() {{
+}
+function scrollBottom() {
   const el = document.getElementById('chat'); el.scrollTop = el.scrollHeight;
-}}
+}
 
-async function ask() {{
+async function ask() {
   const q = document.getElementById('q').value.trim();
   if(!q) return;
-  if(!SELECTED_TYPE) {{ addBot('Please select a surgery type first.'); return; }}
+  if(!SELECTED_TYPE) { addBot('Please select a surgery type first.'); return; }
   addUser(q); document.getElementById('q').value='';
   const spin = spinner();
-  const body = {{question:q, session_id:SESSION_ID, selected_type:SELECTED_TYPE}};
-  const data = await fetch('/ask', {{
-    method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(body)
-  }}).then(r=>r.json());
+  const body = {question:q, session_id:SESSION_ID, selected_type:SELECTED_TYPE};
+  const data = await fetch('/ask', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+  }).then(r=>r.json());
   spin.remove();
   addBot(data.answer);
 
-  // Adaptive pills from server
-  if(data.pills && data.pills.length) {{
+  if(data.pills && data.pills.length) {
     const el = document.getElementById('pills'); el.innerHTML='';
-    data.pills.forEach(label => {{
+    data.pills.forEach(label => {
       const b = document.createElement('button'); b.className='pill'; b.textContent=label;
-      b.onclick = () => {{ document.getElementById('q').value = label; ask(); }};
+      b.onclick = () => { document.getElementById('q').value = label; ask(); };
       el.appendChild(b);
-    }});
-  }}
+    });
+  }
 
-  if(data.unverified) {{
+  if(data.unverified) {
     addBot('<div style="color:#6b7280;font-size:12px;margin-top:6px;">This information is not verified by the clinic; please contact your provider with questions.</div>');
-  }}
+  }
 
   await listSessions();
-}}
+}
 
 boot();
 </script>
@@ -613,54 +626,39 @@ def ask(body: AskBody):
         return {"answer": f"Search failed: {type(e).__name__}: {e}", "pills": [], "unverified": False}
 
     # Only consider coverage within the selected type
-    covered = likely_covered(q, docs, dists, dist_thresh=0.33)
-
-    # If there are literally no docs for this type in the DB, mark unverified by design
-    no_docs_for_type = (len(docs) == 0)
+    covered = likely_covered(q, docs, dists, dist_thresh=0.35)
 
     # Build answer
     unverified = False
     if covered and docs:
+        # STRICT: doc-only answer (no external info)
         ctx = "\n\n".join(docs[:3])
         prompt = (
             "Answer ONLY using the clinic document context below. "
+            "If the context is insufficient, reply with the single token: INSUFFICIENT_CONTEXT. "
             f"Scope your answer to this procedure type: {selected_type}. "
-            "Write in patient-friendly language. No external facts.\n\n"
+            "Write in patient-friendly language. Do NOT add external facts.\n\n"
             f"Question: {q}\n\nContext:\n{ctx}\n\nAnswer:"
         )
         raw = make_llm_answer(prompt, system="You are a careful medical educator.")
-        answer_text = summarize_to_2_or_3_sentences(raw)
-        unverified = False
-    else:
-        # Doc did not cover this (within the chosen type) -> unverified fallback
-        prompt = (
-            f"The clinic document did not cover this clearly for {selected_type}. "
-            "Provide a short, patient-friendly answer based on general medical knowledge. "
-            "Be accurate but concise.\n\n"
-            f"Question: {q}\n\nAnswer:"
-        )
-        raw = make_llm_answer(prompt, system="You are a careful medical educator.")
-        answer_text = summarize_to_2_or_3_sentences(raw)
-        unverified = True
-
-    # Special handling for "recommended" phrasing
-    if re.search(r"\bwhen\s+is\s+(a\s+)?(shoulder\s+)?(arthroscopy|repair|decompression|tenodesis|release|excision)\s+recommended\??", q.lower()):
-        if covered and docs:
-            ctx = "\n\n".join(docs[:3])
-            prompt = (
-                f"Using ONLY the context, list common indications for {selected_type} "
-                "and compress to 2–3 sentences for patients. No external info.\n\n"
-                f"Context:\n{ctx}\n\n2–3 sentence answer:"
-            )
-            answer_text = make_llm_answer(prompt, system="You are a concise medical explainer.")
-            unverified = False
+        if "INSUFFICIENT_CONTEXT" in raw:
+            # Treat as not covered
+            covered = False
         else:
-            prompt = (
-                f"List the common indications for {selected_type} in 2–3 sentences for patients. "
-                "Keep it neutral and high-level."
-            )
-            answer_text = make_llm_answer(prompt, system="You are a concise medical explainer.")
-            unverified = True
+            answer_text = summarize_to_2_or_3_sentences(raw)
+            unverified = False
+
+    if not covered:
+        # Fallback: external (Cleveland Clinic styled) and clearly unverified
+        prompt = (
+            "Provide a short, accurate, patient-friendly 2–3 sentence answer about shoulder surgery, "
+            "summarized in the style of Cleveland Clinic patient education content. "
+            "Begin with: 'According to Cleveland Clinic,' and keep it neutral. "
+            "Do NOT fabricate statistics or quotes."
+            f"\n\nQuestion: {q}\n\nAnswer:"
+        )
+        answer_text = make_llm_answer(prompt, system="You are a careful, neutral medical explainer.")
+        unverified = True
 
     # Adaptive follow-ups (type-scoped)
     pills = adaptive_followups(q, answer_text, selected_type)
