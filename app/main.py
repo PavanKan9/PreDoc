@@ -4,13 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import os, io, re, uuid, json
+import os, io, re, uuid
 
 from openai import OpenAI
 import chromadb
 from chromadb.utils import embedding_functions
 
-# ---- Project-local utilities (safe fallback) ----
+# ---- Project-local safety (no-op fallback) ----
 try:
     from .safety import triage_flags
 except Exception:
@@ -203,7 +203,7 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
     return base[:4]
 
 def likely_covered(question: str, docs: List[str], dists: List[float], dist_thresh: float = 0.35) -> bool:
-    # 1) similarity threshold; 2) keyword overlap heuristic to capture paraphrases
+    # 1) vector distance; 2) keyword overlap (captures paraphrases)
     if not dists or not docs:
         return False
     if min(dists) <= dist_thresh:
@@ -237,8 +237,8 @@ class AskBody(BaseModel):
 # ========= ROUTES =========
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Homescreen hero (Welcome + dropdown with Apple-like orange accent) -> Chat UI matching your layout.
-    return HTMLResponse(f"""
+    # IMPORTANT: plain triple-quoted string (NOT an f-string) to avoid brace-escaping issues.
+    return HTMLResponse("""
 <!doctype html>
 <html lang="en">
 <head>
@@ -246,94 +246,94 @@ def home():
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Patient Education</title>
 <style>
-  :root {{
+  :root {
     --bg:#fff; --text:#0b0b0c; --muted:#6b7280; --border:#eaeaea;
     --chip:#f6f6f6; --chip-border:#d9d9d9; --pill-border:#dbdbdb;
     --accent:#0a84ff; --orange:#ff7a18; --orange-soft:#ffe8d6;
     --sidebar-w: 15rem;
-  }}
-  * {{ box-sizing:border-box; }}
-  body {{
+  }
+  * { box-sizing:border-box; }
+  body {
     margin:0; background:var(--bg); color:var(--text);
     font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
-  }}
-  .app {{ display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }}
+  }
+  .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }
 
   /* Sidebar */
-  .sidebar {{ border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }}
-  .new-chat {{
+  .sidebar { border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }
+  .new-chat {
     display:block; width:100%; padding:10px 12px; margin-bottom:14px;
     border:1px solid var(--border); border-radius:12px; background:#fff; cursor:pointer; font-weight:600;
-  }}
-  .side-title {{ font-size:13px; font-weight:600; color:#333; margin:6px 0 8px; }}
-  .skeleton {{ height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%; }}
-  .skeleton:nth-child(2) {{ width:70%; }} .skeleton:nth-child(3) {{ width:60%; }}
+  }
+  .side-title { font-size:13px; font-weight:600; color:#333; margin:6px 0 8px; }
+  .skeleton { height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%; }
+  .skeleton:nth-child(2) { width:70%; } .skeleton:nth-child(3) { width:60%; }
 
   /* Main */
-  .main {{ display:flex; flex-direction:column; min-width:0; }}
+  .main { display:flex; flex-direction:column; min-width:0; }
 
   /* HERO */
-  .hero {{ flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }}
-  .hero-inner {{ text-align:center; max-width:820px; }}
-  .hero .badge {{
+  .hero { flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }
+  .hero-inner { text-align:center; max-width:820px; }
+  .hero .badge {
     display:inline-block; padding:6px 12px; border-radius:999px; background:var(--orange-soft); color:#9a4b00;
     font-weight:700; font-size:12px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:14px;
-  }}
-  .hero h1 {{
+  }
+  .hero h1 {
     font-size: clamp(30px, 4.5vw, 46px);
     line-height:1.08; margin:0 0 10px; font-weight:800; letter-spacing:-0.02em;
     background: linear-gradient(90deg, var(--text), #333 60%, var(--orange));
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-  }}
-  .hero p {{ color:var(--muted); margin:0 0 22px; font-size:16px; }}
-  .hero .selector {{ display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }}
-  .hero label {{ color:#111; font-weight:600; }}
-  .hero select {{ min-width:280px; border:1px solid var(--border); border-radius:12px; padding:10px 12px; }}
+  }
+  .hero p { color:var(--muted); margin:0 0 22px; font-size:16px; }
+  .hero .selector { display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }
+  .hero label { color:#111; font-weight:600; }
+  .hero select { min-width:280px; border:1px solid var(--border); border-radius:12px; padding:10px 12px; }
 
   /* TOPBAR (chat view) */
-  .topbar {{ display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }}
-  .title {{ font-size:22px; font-weight:700; letter-spacing:.2px; }}
-  .topic-chip {{
+  .topbar { display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }
+  .title { font-size:22px; font-weight:700; letter-spacing:.2px; }
+  .topic-chip {
     position:absolute; right:18px; top:12px;
     background:var(--chip); border:1px solid var(--chip-border); color:#333;
     padding:8px 14px; border-radius:999px; font-size:13px;
     display:flex; align-items:center; gap:8px; cursor:pointer;
-  }}
-  .topic-panel {{
+  }
+  .topic-panel {
     position:absolute; right:18px; top:52px; background:#fff; border:1px solid var(--border);
     border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:10px; display:none; z-index:10;
-  }}
-  .topic-panel select {{ border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }}
+  }
+  .topic-panel select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }
 
-  .content {{ flex:1; display:flex; flex-direction:column; overflow:hidden; }}
-  .chat-area {{ flex:1; overflow:auto; padding:18px 24px; }}
-  .pills {{ display:flex; flex-wrap:wrap; gap:14px; padding:0 24px 12px; }}
-  .pill {{
+  .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+  .chat-area { flex:1; overflow:auto; padding:18px 24px; }
+  .pills { display:flex; flex-wrap:wrap; gap:14px; padding:0 24px 12px; }
+  .pill {
     border:1px solid var(--pill-border); background:#fff; padding:12px 16px; border-radius:999px;
     font-size:16px; cursor:pointer; line-height:1; box-shadow: 0 1px 0 rgba(0,0,0,0.02);
-  }}
+  }
 
-  .bubble {{ max-width:820px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0; line-height:1.45; }}
-  .bot {{ background:#fafafa; }}
-  .user {{ background:#fff; margin-left:auto; border-color:#ddd; }}
+  .bubble { max-width:820px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0; line-height:1.45; }
+  .bot { background:#fafafa; }
+  .user { background:#fff; margin-left:auto; border-color:#ddd; }
 
-  .composer-wrap {{ border-top:1px solid var(--border); padding:12px 24px; }}
-  .composer {{
+  .composer-wrap { border-top:1px solid var(--border); padding:12px 24px; }
+  .composer {
     display:flex; align-items:center; gap:10px; max-width:920px;
     border:1px solid var(--border); border-radius:16px; padding:8px 12px; margin:0 auto;
-  }}
-  .composer input {{ flex:1; border:none; outline:none; font-size:16px; padding:10px 12px; }}
-  .fab {{
+  }
+  .composer input { flex:1; border:none; outline:none; font-size:16px; padding:10px 12px; }
+  .fab {
     width:42px; height:42px; border-radius:50%; background:var(--orange);
     display:flex; align-items:center; justify-content:center; cursor:pointer; border:none;
-  }}
-  .fab svg {{ width:20px; height:20px; fill:#fff; }}
+  }
+  .fab svg { width:20px; height:20px; fill:#fff; }
 
-  .spinner {{
-    width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color:var(--accent);
+  .spinner {
+    width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color:#0a84ff;
     animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px;
-  }}
-  @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -417,21 +417,21 @@ async function boot() {
 
 function handleTypeChange(value, fromHero) {
   SELECTED_TYPE = value;
-  // Sync dropdowns + chip label
+  // Sync dropdowns + label
   document.getElementById('typeHero').value = value;
   document.getElementById('typeSelect').value = value;
   document.getElementById('topicText').textContent = (value==='General (All Types)') ? 'Shoulder' : value;
 
-  // Switch UI to chat view
+  // Switch to chat view
   document.getElementById('hero').style.display = 'none';
   document.getElementById('topbar').style.display = 'flex';
   document.getElementById('chatContent').style.display = 'flex';
   document.getElementById('topicPanel').style.display = 'none';
 
-  // Fresh start on new type
+  // Fresh chat for the new type
   document.getElementById('chat').innerHTML = '';
 
-  // Render type-scoped starter pills
+  // Type-scoped starter pills
   renderTypePills();
 
   // Inform scope
@@ -612,7 +612,7 @@ def ask(body: AskBody):
     if selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
         where = {"type": selected_type}
 
-    # Retrieve
+    # Retrieve from Chroma
     try:
         res = collection.query(
             query_texts=[q],
@@ -625,31 +625,32 @@ def ask(body: AskBody):
     except Exception as e:
         return {"answer": f"Search failed: {type(e).__name__}: {e}", "pills": [], "unverified": False}
 
-    # Only consider coverage within the selected type
+    # Coverage decision (within selected type only)
     covered = likely_covered(q, docs, dists, dist_thresh=0.35)
 
     # Build answer
     unverified = False
+    answer_text = ""
+
     if covered and docs:
-        # STRICT: doc-only answer (no external info)
-        ctx = "\n\n".join(docs[:3])
+        # STRICT: doc-only (no external info). Force model to bail if context lacks specifics.
+        context = "\n\n".join(docs[:3])
         prompt = (
             "Answer ONLY using the clinic document context below. "
             "If the context is insufficient, reply with the single token: INSUFFICIENT_CONTEXT. "
             f"Scope your answer to this procedure type: {selected_type}. "
             "Write in patient-friendly language. Do NOT add external facts.\n\n"
-            f"Question: {q}\n\nContext:\n{ctx}\n\nAnswer:"
+            f"Question: {q}\n\nContext:\n{context}\n\nAnswer:"
         )
         raw = make_llm_answer(prompt, system="You are a careful medical educator.")
         if "INSUFFICIENT_CONTEXT" in raw:
-            # Treat as not covered
             covered = False
         else:
             answer_text = summarize_to_2_or_3_sentences(raw)
             unverified = False
 
     if not covered:
-        # Fallback: external (Cleveland Clinic styled) and clearly unverified
+        # Fallback: short Cleveland Clinic–style answer (explicitly unverified)
         prompt = (
             "Provide a short, accurate, patient-friendly 2–3 sentence answer about shoulder surgery, "
             "summarized in the style of Cleveland Clinic patient education content. "
