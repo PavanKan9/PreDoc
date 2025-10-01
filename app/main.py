@@ -466,18 +466,6 @@ def ask(body: AskBody):
     SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
     return {"answer": answer_text, "pills": pills[:3], "unverified": (not verified), "session_id": sid}
 
-# ========= Serve Logo (embedded) =========
-# Paste ONE string only—do not repeat LOGO_B64 inside it.
-LOGO_B64 = "iVBORw0KGgoAAAANSUhEUgAAAiYAAAC7CAYAAABRqVXyAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgABwESAAMAAAABAAEAAAEaAAUAAAABAAAATAEbAAUAAAABAAAAYgEoAABHRW5lcmF0ZWQgd2l0aCBHSU1QbWFnZQAAIABJQ0NQIHByb2ZpbGUAAAIAAAAiYXBwbAABAAAAAQAAABoAAAIlAAACWAAAAHlia3BzAAABAAAAPAAAAG5kaWN0AAABAAAAAQAAACAAAAAIZmlsbQAAAwAAAAEAAAAsAAAAAG1udHJSR0IAAAAAAAAAAABYWVogAAAAAAAAAAAAAAAAAAAAAAABbGVuZwAAAAAAAAA4AAAAPGNwcnQAAAAAAAAAEAAAADhEZXNjAAAAAAAAAAkAAABaY1RSQwAAAAAAAAA4AAAAMmRlczIAAAAAAAAAAQAAAC5kc2NtAAAAAAAAAAEAAABwVFJDAAAAAAAAAAAAAAAAZwAAAFhjaHJtAAAAAAAAAAEAAAABAAAAAAAAAABkZXNjAAAAAAAAAABzUkdCIElFQzYxOTY2LTEgUHJvZmlsZQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA_
-
-@app.get("/logo.png")
-def logo_png():
-    import base64
-    try:
-        data = base64.b64decode(LOGO_B64)
-        return Response(content=data, media_type="image/png")
-    except Exception as e:
-        return Response(status_code=404)
 
 # ========= UI =========
 @app.get("/", response_class=HTMLResponse)
