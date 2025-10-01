@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os, io, re, uuid, sys
@@ -11,38 +11,34 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 try:
     from openai import OpenAI
     client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-except Exception as e:
+except Exception:
     client = None
 
 # ---- ChromaDB with Railway-safe fallbacks ----
 import chromadb
 from chromadb.utils import embedding_functions
 
-DATA_DIR = os.environ.get("DATA_DIR", "/data")  # writable in Railway; ephemeral between deploys
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
 INDEX_DIR = os.path.join(DATA_DIR, "chroma")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(INDEX_DIR, exist_ok=True)
 
 def _mk_chroma():
-    """
-    Try persistent storage first (best on Railway), then fall back to in-memory if anything fails.
-    """
     try:
-        client = chromadb.PersistentClient(path=INDEX_DIR)
+        c = chromadb.PersistentClient(path=INDEX_DIR)
         mode = "persistent"
     except Exception as e:
         try:
-            client = chromadb.Client()
+            c = chromadb.Client()
             mode = "memory"
             print(f"[WARN] Persistent Chroma unavailable ({type(e).__name__}: {e}); using in-memory.", file=sys.stderr)
         except Exception as e2:
             print(f"[ERROR] Could not initialize Chroma at all: {e2}", file=sys.stderr)
             raise
-    return client, mode
+    return c, mode
 
 chroma_client, CHROMA_MODE = _mk_chroma()
 
-# Embeddings
 ef = embedding_functions.OpenAIEmbeddingFunction(
     api_key=OPENAI_API_KEY or None, model_name="text-embedding-3-small"
 )
@@ -109,6 +105,7 @@ PROCEDURE_TYPES: Dict[str, List[str]] = {
     "Debridement/Diagnostic Only": ["debridement", "diagnostic arthroscopy", "synovectomy"],
 }
 PROCEDURE_KEYS = list(PROCEDURE_TYPES.keys())
+
 PROCEDURE_PILLS: Dict[str, List[str]] = {
     "General (All Types)": [
         "What is shoulder arthroscopy?",
@@ -297,7 +294,7 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
         return ["How long should I expect pain after surgery?","What non-opioid options are used?","When should I taper medications?","What are red flags of uncontrolled pain?"]
     if re.search(r"\b(weeks?|months?|sling)\b", answer.lower()):
         return ["When do I start passive vs active motion?","When can I sleep without the sling?","What limits should I follow at work/school?","When can I resume sports or lifting?"]
-    return base[:4]
+    return base[:3]  # keep suggestions to 3 to match single-line UI
 
 # ========= FASTAPI =========
 app = FastAPI(title="Patient Education")
@@ -339,7 +336,7 @@ def get_types():
 @app.get("/pills")
 def get_pills(type: str = Query(...)):
     pills = PROCEDURE_PILLS.get(type, PROCEDURE_PILLS["General (All Types)"])
-    return {"pills": pills[:4]}
+    return {"pills": pills[:3]}  # limit to 3 so they fit one row
 
 # ========= Ingest =========
 @app.post("/ingest")
@@ -459,17 +456,33 @@ def ask(body: AskBody):
     verified = (answer_text.strip() != NO_MATCH_MESSAGE.strip())
 
     try:
-        sugs = gen_suggestions(q, answer_text, topic="shoulder", k=4, avoid=[])
+        sugs = gen_suggestions(q, answer_text, topic="shoulder", k=3, avoid=[])
         if not sugs:
             raise ValueError("empty sugg")
-        pills = [s if s.endswith("?") else s + "?" for s in sugs][:4]
+        pills = [s if s.endswith("?") else s + "?" for s in sugs][:3]
     except Exception:
         pills = adaptive_followups(q, answer_text, selected_type)
 
     SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
-    return {"answer": answer_text, "pills": pills, "unverified": (not verified), "session_id": sid}
+    return {"answer": answer_text, "pills": pills[:3], "unverified": (not verified), "session_id": sid}
 
-# ========= UI (your exact block) =========
+# ========= Serve Logo (embedded) =========
+LOGO_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAiYAAAC7CAYAAABRqVXyAAAAAXNSR0IArs4c"
+    "..."  # truncated for brevity in this message — paste the full base64 below
+)
+# NOTE: Replace the line above with the full base64 string from the chat (no newlines).
+
+@app.get("/logo.png")
+def logo_png():
+    import base64
+    try:
+        data = base64.b64decode(LOGO_B64)
+        return Response(content=data, media_type="image/png")
+    except Exception as e:
+        return Response(status_code=404)
+
+# ========= UI =========
 @app.get("/", response_class=HTMLResponse)
 def home():
     # Plain triple-quoted string (NOT f-string) to avoid brace escaping issues.
@@ -496,6 +509,11 @@ def home():
 
   /* Sidebar */
   .sidebar { border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }
+  .home-logo {
+    display:flex; align-items:center; justify-content:center;
+    padding:6px 4px 10px; cursor:pointer; user-select:none;
+  }
+  .home-logo img { width:100%; max-width: 200px; height:auto; object-fit:contain; }
   .new-chat {
     display:block; width:100%; padding:10px 12px; margin-bottom:14px;
     border:1px solid var(--border); border-radius:12px; background:#fff; cursor:pointer; font-weight:600;
@@ -517,12 +535,11 @@ def home():
   .hero h1 {
     font-size: clamp(36px, 4.6vw, 52px);
     line-height:1.08; margin:0 0 14px; font-weight:800; letter-spacing:-0.02em;
-    color:#000; /* full black */
+    color:#000;
   }
   .hero p { color:var(--muted); margin:0 0 22px; font-size:16px; }
   .hero .selector { display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }
   .hero label { color:#111; font-weight:600; }
-  /* Orange border (only border, not text) */
   .hero select {
     min-width:280px; border:2px solid var(--orange); border-radius:12px; padding:10px 12px; background:#fff; color:inherit;
   }
@@ -543,11 +560,19 @@ def home():
 
   .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
   .chat-area { flex:1; overflow:auto; padding:18px 24px; }
-  .pills { display:flex; flex-wrap:wrap; gap:14px; padding:0 24px 12px; }
+
+  /* Pills: single row with horizontal scroll */
+  .pills {
+    display:block; white-space:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch;
+    padding:0 24px 12px;
+  }
   .pill {
+    display:inline-block;
     border:1px solid var(--pill-border); background:#fff; padding:12px 16px; border-radius:999px;
     font-size:16px; cursor:pointer; line-height:1; box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+    margin-right:12px;
   }
+
   .bubble { max-width:820px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0; line-height:1.45; }
   .bot { background:#fafafa; }
   .user { background:#fff; margin-left:auto; border-color:#ddd; }
@@ -559,13 +584,14 @@ def home():
   }
   .composer input { flex:1; border:none; outline:none; font-size:16px; padding:10px 12px; }
   .fab {
-    width:42px; height:42px; border-radius:50%; background:#ff7a18;
+    width:42px; height:42px; border-radius:50%; background:var(--orange);
     display:flex; align-items:center; justify-content:center; cursor:pointer; border:none;
   }
   .fab svg { width:20px; height:20px; fill:#fff; }
 
+  /* Spinner: ORANGE */
   .spinner {
-    width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color:#0a84ff;
+    width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color: var(--orange);
     animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px;
   }
   @keyframes spin { to { transform:rotate(360deg); } }
@@ -574,6 +600,9 @@ def home():
 <body>
 <div class="app">
   <aside class="sidebar">
+    <div class="home-logo" onclick="goHome()" title="Home">
+      <img src="/logo.png" alt="Purchase Orthopedic Clinic"/>
+    </div>
     <button class="new-chat" onclick="newChat()">+ New chat</button>
     <div class="side-title">Previous Chats</div>
     <div id="chats"></div>
@@ -630,6 +659,18 @@ function toggleTopicPanel() {
   p.style.display = (p.style.display === 'block') ? 'none' : 'block';
 }
 
+function goHome() {
+  SELECTED_TYPE = null;
+  document.getElementById('hero').style.display = 'flex';
+  document.getElementById('topbar').style.display = 'none';
+  document.getElementById('chatContent').style.display = 'none';
+  document.getElementById('topicPanel').style.display = 'none';
+  document.getElementById('chat').innerHTML = '';
+  document.getElementById('pills').innerHTML = '';
+  const selHero = document.getElementById('typeHero');
+  if (selHero && selHero.options.length) selHero.value = "General (All Types)";
+}
+
 async function boot() {
   const types = await fetch('/types').then(r=>r.json()).then(d=>d.types||[]);
   const selHero = document.getElementById('typeHero');
@@ -646,7 +687,7 @@ async function boot() {
   selTop.addEventListener('change', () => handleTypeChange(selTop.value, false));
 
   await listSessions();
-  await newChat(true);
+  await newChat(true); // create a session on boot, but stay on home
 }
 
 function handleTypeChange(value, fromHero) {
@@ -693,7 +734,7 @@ async function listSessions() {
 async function newChat(silent=false) {
   const data = await fetch('/sessions/new', {method:'POST'}).then(r=>r.json());
   SESSION_ID = data.session_id;
-  if(!silent) addBot('New chat started. Select a surgery type to begin.');
+  if (!silent) { /* behave like ChatGPT: go to home on New chat */ goHome(); }
   await listSessions();
 }
 
@@ -701,6 +742,10 @@ async function loadSession(id) {
   const data = await fetch('/sessions/'+id).then(r=>r.json());
   SESSION_ID = id;
   const chat = document.getElementById('chat'); chat.innerHTML='';
+  // If you open a previous chat, show chat view
+  document.getElementById('hero').style.display = 'none';
+  document.getElementById('topbar').style.display = 'flex';
+  document.getElementById('chatContent').style.display = 'flex';
   data.messages.forEach(m => { if(m.role==='user') addUser(m.content); else addBot(m.content); });
 }
 
@@ -736,7 +781,7 @@ async function ask() {
 
   if(data.pills && data.pills.length) {
     const el = document.getElementById('pills'); el.innerHTML='';
-    data.pills.forEach(label => {
+    data.pills.slice(0,3).forEach(label => {
       const b = document.createElement('button'); b.className='pill'; b.textContent=label;
       b.onclick = () => { document.getElementById('q').value = label; ask(); };
       el.appendChild(b);
