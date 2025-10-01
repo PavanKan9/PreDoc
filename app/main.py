@@ -287,16 +287,14 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
     last = (last_q or "").lower()
     base = PROCEDURE_PILLS.get(selected_type or "General (All Types)", PROCEDURE_PILLS["General (All Types)"])
     if "recover" in last or "return" in last or "heal" in last:
-        return ["What rehab milestones should I expect?","How is pain typically managed during recovery?","When can I drive again?","When do I transition from sling to full motion?"]
+        return ["What rehab milestones should I expect?","How is pain typically managed during recovery?"]  # 2 max
     if "risk" in last or "complication" in last or "safe" in last:
-        return ["How are risks minimized before and after surgery?","What warning signs should prompt me to call the clinic?","How common are stiffness or re-injury?","What follow-up visits will I have?"]
+        return ["How are risks minimized before and after surgery?","What warning signs should prompt me to call the clinic?"]
     if "therapy" in last or "exercise" in last or "pt" in last:
-        return ["What are the first-week exercises?","When can I start strengthening?","What motions should I avoid early on?","How often will PT sessions be?"]
+        return ["What are the first-week exercises?","When can I start strengthening?"]
     if "pain" in last or "med" in last:
-        return ["How long should I expect pain after surgery?","What non-opioid options are used?","When should I taper medications?","What are red flags of uncontrolled pain?"]
-    if re.search(r"\b(weeks?|months?|sling)\b", answer.lower()):
-        return ["When do I start passive vs active motion?","When can I sleep without the sling?","What limits should I follow at work/school?","When can I resume sports or lifting?"]
-    return base[:3]  # keep suggestions to 3 to match single-line UI
+        return ["How long should I expect pain after surgery?","What non-opioid options are used?"]
+    return base[:2]  # <= TWO
 
 # ========= FASTAPI =========
 app = FastAPI(title="Patient Education")
@@ -316,13 +314,9 @@ class AskBody(BaseModel):
     selected_type: Optional[str] = None
 
 # ---- Mount folder for logo ------
-# repo root (one level up from app/)
-from fastapi.staticfiles import StaticFiles
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT / "static"
-
 app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="static")
-
 
 # ---- Health endpoints for Railway health checks ----
 @app.get("/healthz", response_class=PlainTextResponse)
@@ -347,7 +341,7 @@ def debug_static():
     except Exception as e:
         listing = f"(error listing: {e})"
     return f"STATIC_DIR={p}\nexists={p.exists()}\nfiles:\n{listing}"
-    
+
 # ========= UI helpers =========
 @app.get("/types")
 def get_types():
@@ -355,8 +349,9 @@ def get_types():
 
 @app.get("/pills")
 def get_pills(type: str = Query(...)):
+    # Return at most TWO so nothing gets cut off
     pills = PROCEDURE_PILLS.get(type, PROCEDURE_PILLS["General (All Types)"])
-    return {"pills": pills[:3]}  # limit to 3 so they fit one row
+    return {"pills": pills[:2]}
 
 # ========= Ingest =========
 @app.post("/ingest")
@@ -435,7 +430,7 @@ def ask(body: AskBody):
     SESSIONS[sid]["selected_type"] = selected_type
 
     docs = _retrieve(q, n=10, topic="shoulder", selected_type=selected_type)
-    if (not docs) or all((not (d or "").strip()) for d in docs):
+    if (not docs) or all((not (d or "").trim() if hasattr(d, "trim") else not (d or "").strip()) for d in docs):
         q2 = _paraphrase_once(q)
         if q2 and q2 != q:
             docs = _retrieve(q2, n=10, topic="shoulder", selected_type=selected_type)
@@ -476,21 +471,20 @@ def ask(body: AskBody):
     verified = (answer_text.strip() != NO_MATCH_MESSAGE.strip())
 
     try:
-        sugs = gen_suggestions(q, answer_text, topic="shoulder", k=3, avoid=[])
+        sugs = gen_suggestions(q, answer_text, topic="shoulder", k=2, avoid=[])  # <= TWO
         if not sugs:
             raise ValueError("empty sugg")
-        pills = [s if s.endswith("?") else s + "?" for s in sugs][:3]
+        pills = [s if s.endswith("?") else s + "?" for s in sugs][:2]
     except Exception:
-        pills = adaptive_followups(q, answer_text, selected_type)
+        pills = adaptive_followups(q, answer_text, selected_type)[:2]
 
     SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
-    return {"answer": answer_text, "pills": pills[:3], "unverified": (not verified), "session_id": sid}
-
+    return {"answer": answer_text, "pills": pills[:2], "unverified": (not verified), "session_id": sid}
 
 # ========= UI =========
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Plain triple-quoted string (NOT f-string) to avoid brace escaping issues.
+    # Plain triple-quoted string to avoid brace escaping issues.
     return HTMLResponse("""
 <!doctype html>
 <html lang="en">
@@ -564,28 +558,60 @@ def home():
   .topic-panel select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }
 
   .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
-  .chat-area { flex:1; overflow:auto; padding:18px 24px; }
 
-  /* Pills: single row with horizontal scroll */
+  /* Chat container like ChatGPT: centered narrow column */
+  .chat-area { flex:1; overflow:auto; }
+  .chat-inner {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 18px 24px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .message { display:flex; width:100%; }
+  .message.bot { justify-content: flex-start; }
+  .message.user { justify-content: flex-end; }
+
+  .bubble {
+    max-width: 80%;
+    padding: 12px 14px;
+    border:1px solid var(--border);
+    border-radius: 14px;
+    line-height: 1.45;
+    word-wrap: break-word;
+    word-break: break-word;
+  }
+  .bot .bubble { background:#fafafa; }
+  .user .bubble { background:#fff; border-color:#ddd; }
+
+  /* Pills: wrap, 2 per row max, never cut off */
   .pills {
-    display:block; white-space:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch;
-    padding:0 24px 12px;
+    width:100%;
+    max-width: 820px;
+    margin: 0 auto 8px;
+    padding: 0 24px 12px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+    gap: 10px;
   }
   .pill {
-    display:inline-block;
-    border:1px solid var(--pill-border); background:#fff; padding:12px 16px; border-radius:999px;
-    font-size:16px; cursor:pointer; line-height:1; box-shadow: 0 1px 0 rgba(0,0,0,0.02);
-    margin-right:12px;
+    display:block;
+    border:1px solid var(--pill-border); background:#fff;
+    padding:12px 16px; border-radius:999px; font-size:16px; cursor:pointer;
+    text-align:center; white-space:normal;
   }
 
-  .bubble { max-width:820px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0; line-height:1.45; }
-  .bot { background:#fafafa; }
-  .user { background:#fff; margin-left:auto; border-color:#ddd; }
-
-  .composer-wrap { border-top:1px solid var(--border); padding:12px 24px; }
+  /* Composer centered under chat like ChatGPT */
+  .composer-wrap {
+    border-top:1px solid var(--border);
+    padding:12px 24px;
+  }
   .composer {
-    display:flex; align-items:center; gap:10px; max-width:920px;
-    border:1px solid var(--border); border-radius:16px; padding:8px 12px; margin:0 auto;
+    display:flex; align-items:center; gap:10px; max-width:820px; margin:0 auto;
+    border:1px solid var(--border); border-radius:16px; padding:8px 12px;
+    background:#fff;
   }
   .composer input { flex:1; border:none; outline:none; font-size:16px; padding:10px 12px; }
   .fab {
@@ -600,6 +626,11 @@ def home():
     animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px;
   }
   @keyframes spin { to { transform:rotate(360deg); } }
+
+  @media (max-width: 520px) {
+    .bubble { max-width: 100%; }
+    .pills { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -640,7 +671,10 @@ def home():
     </div>
 
     <div class="content" id="chatContent" style="display:none;">
-      <div class="chat-area" id="chat"></div>
+      <div class="chat-area">
+        <div class="chat-inner" id="chat"></div>
+      </div>
+
       <div class="pills" id="pills"></div>
 
       <div class="composer-wrap">
@@ -703,19 +737,19 @@ function handleTypeChange(value, fromHero) {
 
   document.getElementById('hero').style.display = 'none';
   document.getElementById('topbar').style.display = 'flex';
-  document.getElementById('chatContent').style.display = 'flex';
+  document.getElementById('chatContent').style.display = 'block';
   document.getElementById('topicPanel').style.display = 'none';
 
   document.getElementById('chat').innerHTML = '';
   renderTypePills();
-  addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
+  addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a quick question.');
 }
 
 function renderTypePills() {
   fetch('/pills?type=' + encodeURIComponent(SELECTED_TYPE))
     .then(r=>r.json())
     .then(data => {
-      const pills = data.pills || [];
+      const pills = (data.pills || []).slice(0,2); // <= TWO
       const el = document.getElementById('pills'); el.innerHTML='';
       pills.forEach(label => {
         const b = document.createElement('button'); b.className='pill'; b.textContent=label;
@@ -739,7 +773,7 @@ async function listSessions() {
 async function newChat(silent=false) {
   const data = await fetch('/sessions/new', {method:'POST'}).then(r=>r.json());
   SESSION_ID = data.session_id;
-  if (!silent) { /* behave like ChatGPT: go to home on New chat */ goHome(); }
+  if (!silent) { goHome(); }
   await listSessions();
 }
 
@@ -747,28 +781,38 @@ async function loadSession(id) {
   const data = await fetch('/sessions/'+id).then(r=>r.json());
   SESSION_ID = id;
   const chat = document.getElementById('chat'); chat.innerHTML='';
-  // If you open a previous chat, show chat view
   document.getElementById('hero').style.display = 'none';
   document.getElementById('topbar').style.display = 'flex';
-  document.getElementById('chatContent').style.display = 'flex';
+  document.getElementById('chatContent').style.display = 'block';
   data.messages.forEach(m => { if(m.role==='user') addUser(m.content); else addBot(m.content); });
 }
 
 function addUser(text) {
-  const d = document.createElement('div'); d.className='bubble user'; d.textContent=text;
-  document.getElementById('chat').appendChild(d); scrollBottom();
+  const row = document.createElement('div'); row.className='message user';
+  const b = document.createElement('div'); b.className='bubble'; b.textContent=text;
+  row.appendChild(b);
+  document.getElementById('chat').appendChild(row);
+  scrollBottom();
 }
 function addBot(htmlText) {
-  const d = document.createElement('div'); d.className='bubble bot'; d.innerHTML=htmlText;
-  document.getElementById('chat').appendChild(d); scrollBottom();
+  const row = document.createElement('div'); row.className='message bot';
+  const b = document.createElement('div'); b.className='bubble'; b.innerHTML=htmlText;
+  row.appendChild(b);
+  document.getElementById('chat').appendChild(row);
+  scrollBottom();
 }
 function spinner() {
-  const d = document.createElement('div'); d.className='bubble bot';
-  d.innerHTML='Thinking <span class="spinner"></span>';
-  document.getElementById('chat').appendChild(d); scrollBottom(); return d;
+  const row = document.createElement('div'); row.className='message bot';
+  const b = document.createElement('div'); b.className='bubble';
+  b.innerHTML='Thinking <span class="spinner"></span>';
+  row.appendChild(b);
+  document.getElementById('chat').appendChild(row);
+  scrollBottom();
+  return row;
 }
 function scrollBottom() {
-  const el = document.getElementById('chat'); el.scrollTop = el.scrollHeight;
+  const area = document.querySelector('.chat-area');
+  area.scrollTop = area.scrollHeight;
 }
 
 async function ask() {
@@ -776,22 +820,20 @@ async function ask() {
   if(!q) return;
   if(!SELECTED_TYPE) { addBot('Please select a surgery type first.'); return; }
   addUser(q); document.getElementById('q').value='';
-  const spin = spinner();
+  const spinRow = spinner();
   const body = {question:q, session_id:SESSION_ID, selected_type:SELECTED_TYPE};
   const data = await fetch('/ask', {
     method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
   }).then(r=>r.json());
-  spin.remove();
+  spinRow.remove();
   addBot(data.answer);
 
-  if(data.pills && data.pills.length) {
-    const el = document.getElementById('pills'); el.innerHTML='';
-    data.pills.slice(0,3).forEach(label => {
-      const b = document.createElement('button'); b.className='pill'; b.textContent=label;
-      b.onclick = () => { document.getElementById('q').value = label; ask(); };
-      el.appendChild(b);
-    });
-  }
+  const el = document.getElementById('pills'); el.innerHTML='';
+  (data.pills || []).slice(0,2).forEach(label => {
+    const b = document.createElement('button'); b.className='pill'; b.textContent=label;
+    b.onclick = () => { document.getElementById('q').value = label; ask(); };
+    el.appendChild(b);
+  });
 
   if(data.unverified) {
     addBot('<div style="color:#6b7280;font-size:12px;margin-top:6px;">This information is not verified by the clinic; please contact your provider with questions.</div>');
