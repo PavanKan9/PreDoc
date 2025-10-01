@@ -1,5 +1,7 @@
 # main.py
 from fastapi import FastAPI, UploadFile, File, Query
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
@@ -313,6 +315,15 @@ class AskBody(BaseModel):
     session_id: Optional[str] = None
     selected_type: Optional[str] = None
 
+# ---- Mount folder for logo ------
+# repo root (one level up from app/)
+ROOT = Path(__file__).resolve().parents[1]
+STATIC_DIR = ROOT / "static"
+
+# serve /static/* from the repo's static/ dir
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
 # ---- Health endpoints for Railway health checks ----
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
@@ -586,7 +597,7 @@ def home():
 <div class="app">
   <aside class="sidebar">
     <div class="home-logo" onclick="goHome()" title="Home">
-      <img src="/purchase-logo.png" alt="Purchase Orthopedic Clinic"/>
+      <img src="/static/purchase-logo.png" alt="Purchase Orthopedic Clinic"/>
     </div>
     <button class="new-chat" onclick="newChat()">+ New chat</button>
     <div class="side-title">Previous Chats</div>
