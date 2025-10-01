@@ -586,7 +586,7 @@ def home():
 <div class="app">
   <aside class="sidebar">
     <div class="home-logo" onclick="goHome()" title="Home">
-      <img src="/logo.png" alt="Purchase Orthopedic Clinic"/>
+      <img src="/purchase-logo.png" alt="Purchase Orthopedic Clinic"/>
     </div>
     <button class="new-chat" onclick="newChat()">+ New chat</button>
     <div class="side-title">Previous Chats</div>
