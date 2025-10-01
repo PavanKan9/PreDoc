@@ -1,3 +1,6 @@
+Here’s a merged **main.py** that keeps your exact UI/routes the same as your “current” file, but swaps in the **content** pipeline for retrieval/grounding/summarization. I also preserved your procedure filters by tagging chunks with a `type` at ingest (using your classifier) and scoping retrieval with `selected_type`. Suggestions come from `gen_suggestions` with your adaptive fallback. Unverified answers trigger your existing banner.
+
+```python
 # main.py
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +26,13 @@ except Exception:
     def gen_suggestions(q, answer, topic=None, k=4, avoid=None):
         return []
 
+# If you have a helper that chunks .docx, we’ll use it; otherwise fallback to python-docx here
+try:
+    from .parsing import read_docx_chunks
+    HAVE_READ_DOCX = True
+except Exception:
+    HAVE_READ_DOCX = False
+
 # ========= ENV & GLOBALS =========
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
@@ -37,16 +47,18 @@ ef = embedding_functions.OpenAIEmbeddingFunction(
     api_key=OPENAI_API_KEY, model_name="text-embedding-3-small"
 )
 
-chroma_client = chromadb.PersistentClient(path=os.path.join(DATA_DIR, "chroma"))
-COLLECTION_NAME = "shoulder_arthroscopy"
+# Use single persistent Chroma collection (name from your content code)
+INDEX_DIR = os.path.join(DATA_DIR, "chroma")
+chroma_client = chromadb.PersistentClient(path=INDEX_DIR)
+COLLECTION_NAME = "shoulder_docs"
 collection = chroma_client.get_or_create_collection(
     name=COLLECTION_NAME,
     embedding_function=ef,
     metadata={"hnsw:space": "cosine"}
 )
 
-# ========= PROCEDURE TYPES & PILLS =========
-PROCEDURE_TYPES = {
+# ========= PROCEDURE TYPES & PILLS (UI-preserving) =========
+PROCEDURE_TYPES: Dict[str, List[str]] = {
     "General (All Types)": [],
     "Rotator Cuff Repair": ["rotator cuff", "supraspinatus", "infraspinatus", "subscapularis", "teres minor", "rc tear"],
     "SLAP Repair": ["slap tear", "superior labrum", "biceps anchor", "type ii slap", "labral superior", "slap repair"],
@@ -123,7 +135,7 @@ PROCEDURE_PILLS: Dict[str, List[str]] = {
     ],
 }
 
-# ========= INGEST HELPERS =========
+# ========= Ingest helpers (type classifier preserved) =========
 def classify_chunk(text: str) -> str:
     t = (text or "").lower()
     best = "General (All Types)"
@@ -137,7 +149,8 @@ def classify_chunk(text: str) -> str:
             best = k
     return best
 
-def chunk_docx(file_bytes: bytes) -> List[str]:
+def chunk_docx_bytes(file_bytes: bytes) -> List[str]:
+    # Fallback if .parsing.read_docx_chunks is unavailable
     try:
         import docx
     except ImportError:
@@ -152,7 +165,7 @@ def chunk_docx(file_bytes: bytes) -> List[str]:
         i += size - overlap
     return chunks
 
-# ========= “OLD VERSION” ANSWERING HELPERS (plus improved retrieval) =========
+# ========= “CONTENT” ANSWERING HELPERS (strict grounding) =========
 NO_MATCH_MESSAGE = (
     "I couldn’t find this answered in the clinic’s provided materials. "
     "You can try rephrasing your question, or ask your clinician directly."
@@ -182,54 +195,23 @@ def _paraphrase_once(q: str) -> str:
     except Exception:
         return q
 
-def _keyword_hits(txt: str, selected_type: str) -> int:
-    kws = PROCEDURE_TYPES.get(selected_type, [])
-    if not kws:
-        return 0
-    t = (txt or "").lower()
-    return sum(1 for kw in kws if kw in t)
-
-def _retrieve_scoped(q: str, n: int, selected_type: Optional[str]) -> List[str]:
-    """
-    Two-stage hybrid retrieval:
-    1) Augmented query scoped to selected type (if not 'General').
-    2) If weak, widen to global and re-rank by keyword hits to pull the right procedure text
-       even if it was tagged General during ingest.
-    """
-    # Augmented query adds strong procedure hints to the embedding
-    kw = " ".join(PROCEDURE_TYPES.get(selected_type, []))
-    q_aug = f"{q}\nSurgery type: {selected_type or 'General'}\nKeywords: {kw}".strip()
-
-    docs: List[str] = []
+def _retrieve(q: str, n: int = 5, topic: Optional[str] = "shoulder", selected_type: Optional[str] = None):
+    """Strict retrieval scoped by topic + (optional) procedure type metadata."""
     try:
-        kwargs = {"query_texts": [q_aug], "n_results": max(8, n)}
+        where: Dict[str, Any] = {}
+        if topic:
+            where["topic"] = topic
         if selected_type and selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
-            kwargs["where"] = {"type": selected_type}
-        resA = collection.query(**kwargs)
-        docsA = (resA.get("documents") or [[]])[0]
-        docs.extend([d for d in docsA if isinstance(d, str) and d.strip()])
+            where["type"] = selected_type
+        kwargs = {"query_texts": [q], "n_results": max(8, n)}
+        if where:
+            kwargs["where"] = where
+        res = collection.query(**kwargs)
+        return res.get("documents", [[]])[0]
     except Exception:
-        pass
+        return []
 
-    # If not confident, widen and re-rank by keyword hits
-    if len(docs) < 3:
-        try:
-            resB = collection.query(query_texts=[q_aug], n_results=max(12, n))
-            docsB = (resB.get("documents") or [[]])[0]
-            scored = [(d, _keyword_hits(d, selected_type or "")) for d in docsB if isinstance(d, str) and d.strip()]
-            scored.sort(key=lambda x: x[1], reverse=True)
-            docs_wide = [d for d, _ in scored]
-            seen, merged = set(), []
-            for d in (docs + docs_wide):
-                if d not in seen:
-                    seen.add(d); merged.append(d)
-            docs = merged
-        except Exception:
-            pass
-
-    return docs[:max(n, 8)]
-
-def _build_context(docs: List[str], max_chars: int = 2600) -> str:
+def _build_context(docs: List[str], max_chars: int = 1800) -> str:
     clean_docs = [_normalize(d) for d in docs[:5] if isinstance(d, str) and d.strip()]
     context = "\n\n---\n\n".join(clean_docs)
     return context[:max_chars] if context else ""
@@ -237,16 +219,7 @@ def _build_context(docs: List[str], max_chars: int = 2600) -> str:
 def _summarize_from_context(q: str, context: str) -> str:
     if not context:
         return NO_MATCH_MESSAGE
-
-    # Gentle intent hint for generic questions
-    hint = ""
-    lowq = (q or "").lower()
-    if "risk" in lowq:
-        hint = " Focus on procedure-specific risks described in the material."
-    elif "recover" in lowq or "return" in lowq or "heal" in lowq:
-        hint = " Focus on recovery timelines, milestones, and restrictions from the material."
-
-    msgs = [
+    messages = [
         {
             "role": "system",
             "content": (
@@ -260,17 +233,45 @@ def _summarize_from_context(q: str, context: str) -> str:
                 "You can try rephrasing your question, or ask your clinician directly."
             ),
         },
-        {"role": "user", "content": f"Question: {q}{hint}\n\nMaterial:\n{context}"},
+        {"role": "user", "content": f"Question: {q}\n\nMaterial:\n{context}"},
     ]
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
-            messages=msgs,
+            messages=messages,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception:
         return NO_MATCH_MESSAGE
+
+# Body part detection for cross-topic guard
+_BODY_PARTS = {
+    "shoulder": {"shoulder"},
+    "knee": {"knee"},
+    "hip": {"hip"},
+    "elbow": {"elbow"},
+    "wrist": {"wrist"},
+    "ankle": {"ankle"},
+    "spine": {"spine", "back"},
+    "neck": {"neck", "cervical"},
+    "hand": {"hand", "hands"},
+    "foot": {"foot", "feet"},
+}
+def _mentioned_parts(text: str) -> set:
+    low = (text or "").lower()
+    found = set()
+    for part, tokens in _BODY_PARTS.items():
+        if any(t in low for t in tokens):
+            found.add(part)
+    return found
+
+def _keyword_hits(txt: str, selected_type: str) -> int:
+    kws = PROCEDURE_TYPES.get(selected_type, [])
+    if not kws:
+        return 0
+    t = (txt or "").lower()
+    return sum(1 for kw in kws if kw in t)
 
 def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str]:
     last = (last_q or "").lower()
@@ -322,7 +323,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========= SESSIONS =========
+# ========= SESSIONS (UI-preserving) =========
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 # ========= MODELS =========
@@ -331,7 +332,163 @@ class AskBody(BaseModel):
     session_id: Optional[str] = None
     selected_type: Optional[str] = None
 
-# ========= UI (Welcome + Chat preserved) =========
+# ========= API: Types & Pills (unchanged UI) =========
+@app.get("/types")
+def get_types():
+    return {"types": PROCEDURE_KEYS}
+
+@app.get("/pills")
+def get_pills(type: str = Query(...)):
+    pills = PROCEDURE_PILLS.get(type, PROCEDURE_PILLS["General (All Types)"])
+    return {"pills": pills[:4]}
+
+# ========= Ingest (uses content-style storage + your type tagging) =========
+@app.post("/ingest")
+async def ingest(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".docx"):
+        return JSONResponse({"ok": False, "error": "Please upload a .docx file."}, status_code=400)
+    try:
+        data = await file.read()
+        if HAVE_READ_DOCX:
+            # If you have a dedicated parser
+            path = os.path.join(DATA_DIR, file.filename)
+            with open(path, "wb") as f:
+                f.write(data)
+            chunks = read_docx_chunks(path)
+        else:
+            chunks = chunk_docx_bytes(data)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Ingest failed: {type(e).__name__}: {e}"}, status_code=400)
+
+    docs, ids, metas = [], [], []
+    for i, ch in enumerate(chunks):
+        subtype = classify_chunk(ch)
+        docs.append(ch)
+        ids.append(f"{file.filename}-{i}")
+        # Store both topic and type (content code expects 'topic', our UI expects 'type' for scoping)
+        metas.append({"source": file.filename, "topic": "shoulder", "type": subtype})
+
+    if docs:
+        # Add in sensible batches
+        B = 64
+        for i in range(0, len(docs), B):
+            collection.add(
+                documents=docs[i:i+B],
+                ids=ids[i:i+B],
+                metadatas=metas[i:i+B]
+            )
+    return {"ok": True, "chunks": len(docs), "file": file.filename}
+
+# ========= Sessions API (unchanged UI) =========
+@app.get("/sessions")
+def sessions():
+    out = []
+    for k, v in SESSIONS.items():
+        title = v.get("title") or "New chat"
+        if v.get("messages"):
+            first = v["messages"][0]["content"]
+            title = v.get("title") or (first[:40] + "…")
+        out.append({"id": k, "title": title})
+    out.sort(key=lambda x: x["id"], reverse=True)
+    return {"sessions": out}
+
+@app.post("/sessions/new")
+def new_session():
+    sid = uuid.uuid4().hex[:10]
+    SESSIONS[sid] = {"title": "New chat", "messages": [], "selected_type": None}
+    return {"session_id": sid}
+
+@app.get("/sessions/{sid}")
+def read_session(sid: str):
+    sess = SESSIONS.get(sid, {"messages": []})
+    return {"messages": sess["messages"]}
+
+# ========= ASK (UI contract preserved; content pipeline inside) =========
+@app.post("/ask")
+def ask(body: AskBody):
+    q = (body.question or "").strip()
+    if not q:
+        return {"answer": "Please enter a question.", "pills": [], "unverified": False}
+
+    safety = triage_flags(q)
+    if safety.get("blocked"):
+        return {"answer": "I can’t help with that request.", "pills": [], "unverified": False}
+
+    sid = body.session_id or uuid.uuid4().hex[:10]
+    if sid not in SESSIONS:
+        SESSIONS[sid] = {"title": "New chat", "messages": []}
+    SESSIONS[sid]["messages"].append({"role": "user", "content": q})
+    if not SESSIONS[sid].get("title") or SESSIONS[sid]["title"] == "New chat":
+        SESSIONS[sid]["title"] = q[:60]
+
+    selected_type = body.selected_type or "General (All Types)"
+    SESSIONS[sid]["selected_type"] = selected_type
+
+    # ---- Content-style strict retrieval grounded to uploaded docs ----
+    docs = _retrieve(q, n=10, topic="shoulder", selected_type=selected_type)
+    if (not docs) or all((not (d or "").strip()) for d in docs):
+        q2 = _paraphrase_once(q)
+        if q2 and q2 != q:
+            docs = _retrieve(q2, n=10, topic="shoulder", selected_type=selected_type)
+
+    # If still weak, widen to topic-only then re-rank by type keywords (gentle boost)
+    if (not docs) or len([d for d in docs if d and d.strip()]) < 3:
+        try:
+            global_docs = _retrieve(q, n=12, topic="shoulder", selected_type=None)
+            if global_docs:
+                scored = [(d, _keyword_hits(d, selected_type)) for d in global_docs if isinstance(d, str) and d.strip()]
+                scored.sort(key=lambda x: x[1], reverse=True)
+                # merge keeping uniques, preferring earlier docs then scored
+                seen, merged = set(), []
+                for d in (docs + [x[0] for x in scored]):
+                    if d and d not in seen:
+                        seen.add(d); merged.append(d)
+                docs = merged[:10]
+        except Exception:
+            pass
+
+    context = _build_context(docs, max_chars=1800)
+    answer_text = _summarize_from_context(q, context)
+
+    # Cross-topic guard (avoid answering e.g. knee using shoulder docs)
+    parts_in_q = _mentioned_parts(q)
+    if parts_in_q and ("shoulder" not in parts_in_q):
+        ctx_low = context.lower()
+        if not any(any(tok in ctx_low for tok in _BODY_PARTS[p]) for p in parts_in_q):
+            answer_text = NO_MATCH_MESSAGE
+
+    # One last fallback paraphrase cycle if "not covered"
+    if answer_text.strip() == NO_MATCH_MESSAGE.strip():
+        q2 = _paraphrase_once(q)
+        if q2 and q2 != q:
+            docs2 = _retrieve(q2, n=10, topic="shoulder", selected_type=selected_type)
+            ctx2 = _build_context(docs2, max_chars=1800) if docs2 else ""
+            if ctx2:
+                answer2 = _summarize_from_context(q2, ctx2)
+                if answer2.strip():
+                    answer_text = answer2
+
+    verified = (answer_text.strip() != NO_MATCH_MESSAGE.strip())
+
+    # Suggestions (module first, fallback to adaptive based on your pills)
+    try:
+        sugs = gen_suggestions(q, answer_text, topic="shoulder", k=4, avoid=[])
+        if not sugs:
+            raise ValueError("empty sugg")
+        pills = [s if s.endswith("?") else s + "?" for s in sugs][:4]
+    except Exception:
+        pills = adaptive_followups(q, answer_text, selected_type)
+
+    SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
+
+    return {"answer": answer_text, "pills": pills, "unverified": (not verified), "session_id": sid}
+
+# ========= HEALTH =========
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "ok"
+
+# ========= UI (exactly your current UI) =========
 @app.get("/", response_class=HTMLResponse)
 def home():
     # Plain triple-quoted string (NOT f-string) to avoid brace escaping issues.
@@ -618,110 +775,4 @@ boot();
 </html>
     """)
 
-# ========= API =========
-@app.get("/types")
-def get_types():
-    return {"types": PROCEDURE_KEYS}
-
-@app.get("/pills")
-def get_pills(type: str = Query(...)):
-    pills = PROCEDURE_PILLS.get(type, PROCEDURE_PILLS["General (All Types)"])
-    return {"pills": pills[:4]}
-
-@app.post("/ingest")
-async def ingest(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".docx"):
-        return JSONResponse({"ok": False, "error": "Please upload a .docx file."}, status_code=400)
-    try:
-        data = await file.read()
-        chunks = chunk_docx(data)
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"Ingest failed: {type(e).__name__}: {e}"}, status_code=400)
-
-    docs, ids, metas = [], [], []
-    for i, ch in enumerate(chunks):
-        subtype = classify_chunk(ch)
-        docs.append(ch)
-        ids.append(f"{file.filename}-{i}")
-        metas.append({"source": file.filename, "type": subtype})
-    if docs:
-        collection.add(documents=docs, ids=ids, metadatas=metas)
-    return {"ok": True, "chunks": len(docs), "file": file.filename}
-
-@app.get("/sessions")
-def sessions():
-    out = []
-    for k, v in SESSIONS.items():
-        title = v.get("title") or "New chat"
-        if v.get("messages"):
-            first = v["messages"][0]["content"]
-            title = v.get("title") or (first[:40] + "…")
-        out.append({"id": k, "title": title})
-    out.sort(key=lambda x: x["id"], reverse=True)
-    return {"sessions": out}
-
-@app.post("/sessions/new")
-def new_session():
-    sid = uuid.uuid4().hex[:10]
-    SESSIONS[sid] = {"title": "New chat", "messages": [], "selected_type": None}
-    return {"session_id": sid}
-
-@app.get("/sessions/{sid}")
-def read_session(sid: str):
-    sess = SESSIONS.get(sid, {"messages": []})
-    return {"messages": sess["messages"]}
-
-class AskBodyModel(BaseModel):
-    question: str
-    session_id: Optional[str] = None
-    selected_type: Optional[str] = None
-AskBody = AskBodyModel
-
-@app.post("/ask")
-def ask(body: AskBody):
-    q = (body.question or "").strip()
-    if not q:
-        return {"answer": "Please enter a question.", "pills": [], "unverified": False}
-
-    safety = triage_flags(q)
-    if safety.get("blocked"):
-        return {"answer": "I can’t help with that request.", "pills": [], "unverified": False}
-
-    sid = body.session_id or uuid.uuid4().hex[:10]
-    if sid not in SESSIONS:
-        SESSIONS[sid] = {"title": "New chat", "messages": []}
-    SESSIONS[sid]["messages"].append({"role": "user", "content": q})
-    if not SESSIONS[sid].get("title") or SESSIONS[sid]["title"] == "New chat":
-        SESSIONS[sid]["title"] = q[:60]
-
-    selected_type = body.selected_type or "General (All Types)"
-    SESSIONS[sid]["selected_type"] = selected_type
-
-    # === Improved Retrieval ===
-    docs = _retrieve_scoped(q, n=10, selected_type=selected_type)
-    if (not docs) or all((not (d or "").strip()) for d in docs):
-        q2 = _paraphrase_once(q)
-        if q2 and q2 != q:
-            docs = _retrieve_scoped(q2, n=10, selected_type=selected_type)
-
-    context = _build_context(docs, max_chars=2600)
-    answer_text = _summarize_from_context(q, context)
-
-    verified = (answer_text.strip() != NO_MATCH_MESSAGE.strip())
-
-    # Suggestions (try module; fallback to adaptive)
-    try:
-        sugs = gen_suggestions(q, answer_text, topic="shoulder", k=4, avoid=[])
-        if not sugs:
-            raise ValueError("empty sugg")
-        pills = [s if s.endswith("?") else s + "?" for s in sugs][:4]
-    except Exception:
-        pills = adaptive_followups(q, answer_text, selected_type)
-
-    SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
-
-    return {"answer": answer_text, "pills": pills, "unverified": (not verified), "session_id": sid}
-
-@app.get("/healthz", response_class=PlainTextResponse)
-def healthz():
-    return "ok"
+```
