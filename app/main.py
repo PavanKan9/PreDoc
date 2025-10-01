@@ -317,11 +317,11 @@ class AskBody(BaseModel):
 
 # ---- Mount folder for logo ------
 # repo root (one level up from app/)
+from fastapi.staticfiles import StaticFiles
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT / "static"
 
-# serve /static/* from the repo's static/ dir
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="static")
 
 
 # ---- Health endpoints for Railway health checks ----
@@ -339,6 +339,15 @@ def stats():
         count = f"error: {e}"
     return {"collection": COLLECTION_NAME, "count": count, "chroma_mode": CHROMA_MODE}
 
+@app.get("/debug/static", response_class=PlainTextResponse)
+def debug_static():
+    p = STATIC_DIR
+    try:
+        listing = "\n".join(sorted(f.name for f in p.glob("*"))) if p.exists() else "(dir missing)"
+    except Exception as e:
+        listing = f"(error listing: {e})"
+    return f"STATIC_DIR={p}\nexists={p.exists()}\nfiles:\n{listing}"
+    
 # ========= UI helpers =========
 @app.get("/types")
 def get_types():
