@@ -100,7 +100,8 @@ PROCEDURE_TYPES: Dict[str, List[str]] = {
     "Posterior Labrum Repair": ["posterior labrum", "posterior instability", "reverse bankart"],
     "Biceps Tenodesis/Tenotomy": ["biceps tenodesis", "tenotomy", "biceps tendon", "lhb", "biceps tendinopathy", "tenodesis/tenotomy"],
     "Subacromial Decompression (SAD)": ["subacromial decompression", "acromioplasty", "impingement", "s.a.d"],
-    "Distal Clavicle Excision": ["distal clavicle excision", "dce", "mumford", "ac joint resection"],
+    # Expanded DCE synonyms to improve tagging
+    "Distal Clavicle Excision": ["distal clavicle excision", "dce", "mumford", "ac joint", "ac joint resection", "acromioclavicular"],
     "Capsular Release": ["capsular release", "adhesive capsulitis", "frozen shoulder", "arthroscopic release"],
     "Debridement/Diagnostic Only": ["debridement", "diagnostic arthroscopy", "synovectomy"],
 }
@@ -215,6 +216,10 @@ def _paraphrase_once(q: str) -> str:
         return q
 
 def _retrieve(q: str, n: int = 8, topic: Optional[str] = "shoulder", selected_type: Optional[str] = None):
+    """
+    Retrieval is HARD-filtered to the selected_type when provided (not General).
+    This prevents cross-contamination (e.g., DCE answers mixing with Tenodesis).
+    """
     try:
         where: Dict[str, Any] = {}
         if topic:
@@ -225,13 +230,24 @@ def _retrieve(q: str, n: int = 8, topic: Optional[str] = "shoulder", selected_ty
         if where:
             kwargs["where"] = where
         res = collection.query(**kwargs)
-        return res.get("documents", [[]])[0]
+        docs = res.get("documents", [[]])[0]
+        # Extra guard: reclassify any returned text and keep only matching type (or General)
+        if selected_type and selected_type != "General (All Types)":
+            keep = []
+            for d in docs:
+                if not isinstance(d, str): 
+                    continue
+                tag = classify_chunk(d)
+                if tag == selected_type or tag == "General (All Types)":
+                    keep.append(d)
+            docs = keep
+        return docs
     except Exception as e:
         print(f"[WARN] Retrieval failed: {e}", file=sys.stderr)
         return []
 
 def _build_context(docs: List[str], max_chars: int = 1800) -> str:
-    clean_docs = [_normalize(d) for d in docs[:5] if isinstance(d, str) and d.strip()]
+    clean_docs = [_normalize(d) for d in docs[:8] if isinstance(d, str) and d.strip()]
     context = "\n\n---\n\n".join(clean_docs)
     return context[:max_chars] if context else ""
 
@@ -266,6 +282,32 @@ def _summarize_from_context(q: str, context: str) -> str:
         print(f"[WARN] LLM summarize failed: {e}", file=sys.stderr)
         return NO_MATCH_MESSAGE
 
+def _external_answer(q: str) -> str:
+    """
+    Best-effort general medical response (no clinic materials).
+    Kept short; the caller marks it unverified.
+    """
+    if not client:
+        return ""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=[
+                {"role":"system","content":
+                 ("You are an orthopedics educator. In 2–3 concise sentences (≤80 words), "
+                  "answer using general, widely accepted post-op guidance. "
+                  "Avoid definitive timelines that vary by surgeon; use ranges and say 'typically' when appropriate. "
+                  "Do NOT invent clinic-specific policies or cite sources.")
+                 },
+                {"role":"user","content": q}
+            ]
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[WARN] External answer failed: {e}", file=sys.stderr)
+        return ""
+
 _BODY_PARTS = {
     "shoulder": {"shoulder"}, "knee": {"knee"}, "hip": {"hip"}, "elbow": {"elbow"},
     "wrist": {"wrist"}, "ankle": {"ankle"}, "spine": {"spine","back"}, "neck": {"neck","cervical"},
@@ -294,7 +336,7 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
         return ["How long should I expect pain after surgery?","What non-opioid options are used?","When should I taper medications?","What are red flags of uncontrolled pain?"]
     if re.search(r"\b(weeks?|months?|sling)\b", answer.lower()):
         return ["When do I start passive vs active motion?","When can I sleep without the sling?","What limits should I follow at work/school?","When can I resume sports or lifting?"]
-    return base[:3]  # keep suggestions to 3 to match single-line UI
+    return base[:3]
 
 # ========= FASTAPI =========
 app = FastAPI(title="Patient Education")
@@ -336,7 +378,7 @@ def get_types():
 @app.get("/pills")
 def get_pills(type: str = Query(...)):
     pills = PROCEDURE_PILLS.get(type, PROCEDURE_PILLS["General (All Types)"])
-    return {"pills": pills[:3]}  # limit to 3 so they fit one row
+    return {"pills": pills[:3]}  # single-line pill row
 
 # ========= Ingest =========
 @app.post("/ingest")
@@ -414,47 +456,52 @@ def ask(body: AskBody):
     selected_type = body.selected_type or "General (All Types)"
     SESSIONS[sid]["selected_type"] = selected_type
 
-    docs = _retrieve(q, n=10, topic="shoulder", selected_type=selected_type)
-    if (not docs) or all((not (d or "").strip()) for d in docs):
+    # Primary retrieval (HARD filter to selected_type when set)
+    docs = _retrieve(q, n=12, topic="shoulder", selected_type=selected_type)
+
+    # Paraphrase retry within SAME type only
+    if (not docs) or len([d for d in docs if d and d.strip()]) < 3:
         q2 = _paraphrase_once(q)
         if q2 and q2 != q:
-            docs = _retrieve(q2, n=10, topic="shoulder", selected_type=selected_type)
+            docs = _retrieve(q2, n=12, topic="shoulder", selected_type=selected_type)
 
-    if (not docs) or len([d for d in docs if d and d.strip()]) < 3:
-        try:
-            global_docs = _retrieve(q, n=12, topic="shoulder", selected_type=None)
-            if global_docs:
-                scored = [(d, _keyword_hits(d, selected_type)) for d in global_docs if isinstance(d, str) and d.strip()]
-                scored.sort(key=lambda x: x[1], reverse=True)
-                seen, merged = set(), []
-                for d in (docs + [x[0] for x in scored]):
-                    if d and d not in seen:
-                        seen.add(d); merged.append(d)
-                docs = merged[:10]
-        except Exception:
-            pass
+    # Light expansion: keep only same-type or general chunks; rank by keyword hits for the same type
+    if docs:
+        scored = [(d, _keyword_hits(d, selected_type)) for d in docs if isinstance(d, str) and d.strip()]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        docs = [x[0] for x in scored]
 
     context = _build_context(docs, max_chars=1800)
     answer_text = _summarize_from_context(q, context)
 
+    # Body part sanity check
     parts_in_q = _mentioned_parts(q)
     if parts_in_q and ("shoulder" not in parts_in_q):
         ctx_low = context.lower()
         if not any(any(tok in ctx_low for tok in _BODY_PARTS[p]) for p in parts_in_q):
             answer_text = NO_MATCH_MESSAGE
 
+    # Retry once with paraphrase if we still didn't match
     if answer_text.strip() == NO_MATCH_MESSAGE.strip():
         q2 = _paraphrase_once(q)
         if q2 and q2 != q:
-            docs2 = _retrieve(q2, n=10, topic="shoulder", selected_type=selected_type)
+            docs2 = _retrieve(q2, n=12, topic="shoulder", selected_type=selected_type)
             ctx2 = _build_context(docs2, max_chars=1800) if docs2 else ""
             if ctx2:
                 answer2 = _summarize_from_context(q2, ctx2)
-                if answer2.strip():
+                if answer2.strip() and answer2.strip() != NO_MATCH_MESSAGE.strip():
                     answer_text = answer2
 
     verified = (answer_text.strip() != NO_MATCH_MESSAGE.strip())
 
+    # FINAL FALLBACK: external best-effort (unverified)
+    if not verified:
+        ext = _external_answer(q)
+        if ext:
+            answer_text = ext
+            verified = False  # keep unverified
+
+    # Suggestions
     try:
         sugs = gen_suggestions(q, answer_text, topic="shoulder", k=3, avoid=[])
         if not sugs:
@@ -469,9 +516,8 @@ def ask(body: AskBody):
 # ========= Serve Logo (embedded) =========
 LOGO_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAiYAAAC7CAYAAABRqVXyAAAAAXNSR0IArs4c"
-    "..."  # truncated for brevity in this message — paste the full base64 below
+    "..."  # <- paste the full base64 string you have
 )
-# NOTE: Replace the line above with the full base64 string from the chat (no newlines).
 
 @app.get("/logo.png")
 def logo_png():
@@ -734,7 +780,7 @@ async function listSessions() {
 async function newChat(silent=false) {
   const data = await fetch('/sessions/new', {method:'POST'}).then(r=>r.json());
   SESSION_ID = data.session_id;
-  if (!silent) { /* behave like ChatGPT: go to home on New chat */ goHome(); }
+  if (!silent) { goHome(); } // behave like ChatGPT
   await listSessions();
 }
 
@@ -742,7 +788,6 @@ async function loadSession(id) {
   const data = await fetch('/sessions/'+id).then(r=>r.json());
   SESSION_ID = id;
   const chat = document.getElementById('chat'); chat.innerHTML='';
-  // If you open a previous chat, show chat view
   document.getElementById('hero').style.display = 'none';
   document.getElementById('topbar').style.display = 'flex';
   document.getElementById('chatContent').style.display = 'flex';
