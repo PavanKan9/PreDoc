@@ -10,7 +10,7 @@ from openai import OpenAI
 import chromadb
 from chromadb.utils import embedding_functions
 
-# ---- Project-local safety (no-op fallback) ----
+# ---- Project-local safety (no-op fallback if missing) ----
 try:
     from .safety import triage_flags
 except Exception:
@@ -151,15 +151,15 @@ def make_llm_answer(prompt: str, system: str = "You are a concise medical explai
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
-        temperature=0.2,
+        temperature=0.1,
         max_tokens=320,
     )
     return resp.choices[0].message.content.strip()
 
 def summarize_to_2_or_3_sentences(text: str) -> str:
     return make_llm_answer(
-        "Summarize the answer into 2–3 patient-friendly sentences without losing key specifics:\n\n" + text,
-        system="You compress long answers into 2–3 clear sentences."
+        "Summarize the answer into 2–3 patient-friendly sentences (45–80 words) without adding new facts:\n\n" + text,
+        system="You compress long answers into 2–3 clear sentences using ONLY what you were given."
     )
 
 def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str]:
@@ -203,7 +203,6 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
     return base[:4]
 
 def likely_covered(question: str, docs: List[str], dists: List[float], dist_thresh: float = 0.35) -> bool:
-    # 1) vector distance; 2) keyword overlap (captures paraphrases)
     if not dists or not docs:
         return False
     if min(dists) <= dist_thresh:
@@ -237,7 +236,7 @@ class AskBody(BaseModel):
 # ========= ROUTES =========
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # IMPORTANT: plain triple-quoted string (NOT an f-string) to avoid brace-escaping issues.
+    # Plain triple-quoted string (NOT an f-string) to avoid brace escaping issues.
     return HTMLResponse("""
 <!doctype html>
 <html lang="en">
@@ -288,7 +287,11 @@ def home():
   .hero p { color:var(--muted); margin:0 0 22px; font-size:16px; }
   .hero .selector { display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }
   .hero label { color:#111; font-weight:600; }
-  .hero select { min-width:280px; border:1px solid var(--border); border-radius:12px; padding:10px 12px; }
+  /* --- Change requested: orange border on the dropdown, NOT the text --- */
+  .hero select {
+    min-width:280px; border:2px solid var(--orange); border-radius:12px; padding:10px 12px;
+    color:inherit; background:#fff;
+  }
 
   /* TOPBAR (chat view) */
   .topbar { display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }
@@ -591,7 +594,7 @@ AskBody = AskBodyModel
 def ask(body: AskBody):
     q = (body.question or "").strip()
     if not q:
-        return {"answer": "Please enter a question.", "pills": []}
+        return {"answer": "Please enter a question.", "pills": [], "unverified": False}
 
     safety = triage_flags(q)
     if safety.get("blocked"):
@@ -625,7 +628,7 @@ def ask(body: AskBody):
     except Exception as e:
         return {"answer": f"Search failed: {type(e).__name__}: {e}", "pills": [], "unverified": False}
 
-    # Coverage decision (within selected type only)
+    # Decide coverage (within selected type only)
     covered = likely_covered(q, docs, dists, dist_thresh=0.35)
 
     # Build answer
@@ -633,17 +636,17 @@ def ask(body: AskBody):
     answer_text = ""
 
     if covered and docs:
-        # STRICT: doc-only (no external info). Force model to bail if context lacks specifics.
-        context = "\n\n".join(docs[:3])
+        # STRICT: doc-only (no external info). Force the model to bail if insufficient.
+        context = "\n\n---\n\n".join([d for d in docs[:3] if isinstance(d, str) and d.strip()])[:1800]
         prompt = (
-            "Answer ONLY using the clinic document context below. "
-            "If the context is insufficient, reply with the single token: INSUFFICIENT_CONTEXT. "
-            f"Scope your answer to this procedure type: {selected_type}. "
-            "Write in patient-friendly language. Do NOT add external facts.\n\n"
-            f"Question: {q}\n\nContext:\n{context}\n\nAnswer:"
+            "Answer ONLY using the clinic document material below. "
+            "If the material does NOT answer the question, reply with EXACTLY:\n"
+            "NO_MATCH\n"
+            "Write 2–3 clear sentences (45–80 words). Do NOT add external facts or cite sources.\n\n"
+            f"Question: {q}\n\nMaterial:\n{context}\n\nAnswer:"
         )
-        raw = make_llm_answer(prompt, system="You are a careful medical educator.")
-        if "INSUFFICIENT_CONTEXT" in raw:
+        raw = make_llm_answer(prompt, system="You are a careful medical explainer that never adds outside info.")
+        if "NO_MATCH" in raw:
             covered = False
         else:
             answer_text = summarize_to_2_or_3_sentences(raw)
