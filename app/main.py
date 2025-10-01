@@ -10,12 +10,18 @@ from openai import OpenAI
 import chromadb
 from chromadb.utils import embedding_functions
 
-# ---- Safety (no-op fallback if missing) ----
+# ---- Optional safety & suggestions (graceful fallbacks) ----
 try:
     from .safety import triage_flags
 except Exception:
     def triage_flags(text: str) -> Dict[str, Any]:
         return {"blocked": False, "reasons": []}
+
+try:
+    from .sugg import gen_suggestions  # optional; we still have adaptive pills fallback
+except Exception:
+    def gen_suggestions(q, answer, topic=None, k=4, avoid=None):
+        return []
 
 # ========= ENV & GLOBALS =========
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -117,7 +123,7 @@ PROCEDURE_PILLS: Dict[str, List[str]] = {
     ],
 }
 
-# ========= HELPERS =========
+# ========= INGEST HELPERS =========
 def classify_chunk(text: str) -> str:
     t = text.lower()
     best = "General (All Types)"
@@ -146,24 +152,82 @@ def chunk_docx(file_bytes: bytes) -> List[str]:
         i += size - overlap
     return chunks
 
-def make_llm_answer(prompt: str, system: str = "You are a careful medical explainer that ONLY uses the provided context.") -> str:
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
-        temperature=0.0,
-        max_tokens=340,
-    )
-    return resp.choices[0].message.content.strip()
+# ========= “OLD VERSION” ANSWERING HELPERS (ported verbatim in spirit) =========
+NO_MATCH_MESSAGE = (
+    "I couldn’t find this answered in the clinic’s provided materials. "
+    "You can try rephrasing your question, or ask your clinician directly."
+)
 
-def summarize_from_context(question: str, context: str) -> str:
-    # Absolutely no external info; if not covered, return sentinel.
-    prompt = (
-        "Using ONLY the material below, answer the question in 2–3 clear sentences (45–90 words). "
-        "If the material does NOT answer the question, reply EXACTLY with: NO_MATCH\n\n"
-        f"Question: {question}\n\nMaterial:\n{context}\n\nAnswer:"
-    )
-    return make_llm_answer(prompt)
+def _normalize(txt: str) -> str:
+    if not isinstance(txt, str):
+        return ""
+    t = txt.strip()
+    t = re.sub(r"(?:^|\n)(Q:|Question:).*?$", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"(?:^|\n)(A:|Answer:).*?$", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
 
+def _paraphrase_once(q: str) -> str:
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "Paraphrase the user's medical question in one sentence. Preserve meaning; don't add new claims."},
+                {"role": "user", "content": q},
+            ],
+        )
+        p = (r.choices[0].message.content or "").strip()
+        return p or q
+    except Exception:
+        return q
+
+def _retrieve_scoped(q: str, n: int = 5, selected_type: Optional[str] = None) -> List[str]:
+    """Retrieval scoped by procedure type metadata."""
+    try:
+        kwargs = {"query_texts": [q], "n_results": n}
+        if selected_type and selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
+            kwargs["where"] = {"type": selected_type}
+        res = collection.query(**kwargs)
+        return res.get("documents", [[]])[0]
+    except Exception:
+        return []
+
+def _build_context(docs: List[str], max_chars: int = 1800) -> str:
+    clean_docs = [_normalize(d) for d in docs[:3] if isinstance(d, str) and d.strip()]
+    context = "\n\n---\n\n".join(clean_docs)
+    return context[:max_chars] if context else ""
+
+def _summarize_from_context(q: str, context: str) -> str:
+    if not context:
+        return NO_MATCH_MESSAGE
+    msgs = [
+        {
+            "role": "system",
+            "content": (
+                "You are a medical explainer. "
+                "Write 2–3 clear sentences (45–80 words) using only the provided material. "
+                "Start directly with the answer; do not refer to documents, material, context, sources, or clinics. "
+                "Do not add pleasantries, introductions, or disclaimers. "
+                "Use the document’s terminology when naming conditions or procedures. "
+                "If the material does not answer the question, reply EXACTLY with: "
+                "I couldn’t find this answered in the clinic’s provided materials. "
+                "You can try rephrasing your question, or ask your clinician directly."
+            ),
+        },
+        {"role": "user", "content": f"Question: {q}\n\nMaterial:\n{context}"},
+    ]
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=msgs,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return NO_MATCH_MESSAGE
+
+# ========= ADAPTIVE PILLS =========
 def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str]:
     last = (last_q or "").lower()
     base = PROCEDURE_PILLS.get(selected_type or "General (All Types)", PROCEDURE_PILLS["General (All Types)"])
@@ -204,14 +268,13 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
         ]
     return base[:4]
 
-def likely_covered(question: str, docs: List[str], dists: List[float], dist_thresh: float = 0.33) -> bool:
-    if not dists or not docs:
+def likely_covered(question: str, docs: List[str], dist_thresh: float = 0.35) -> bool:
+    if not docs:
         return False
-    if min(dists) <= dist_thresh:
-        return True
+    # token overlap heuristic
     q_tokens = set(re.findall(r"[a-z]{3,}", question.lower()))
     for d in docs[:3]:
-        d_tokens = set(re.findall(r"[a-z]{3,}", d.lower()))
+        d_tokens = set(re.findall(r"[a-z]{3,}", (d or "").lower()))
         if len(q_tokens & d_tokens) >= 3:
             return True
     return False
@@ -256,7 +319,7 @@ def home():
   * { box-sizing:border-box; }
   body {
     margin:0; background:var(--bg); color:var(--text);
-    /* Slightly cleaner font stack (welcome looks crisper) */
+    /* Slightly cleaner font stack for welcome */
     font-family: "SF Pro Text","SF Pro Display",-apple-system,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   }
   .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }
@@ -284,12 +347,12 @@ def home():
   .hero h1 {
     font-size: clamp(36px, 4.6vw, 52px);
     line-height:1.08; margin:0 0 14px; font-weight:800; letter-spacing:-0.02em;
-    color:#000; /* all black per request */
+    color:#000; /* full black */
   }
   .hero p { color:var(--muted); margin:0 0 22px; font-size:16px; }
   .hero .selector { display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }
   .hero label { color:#111; font-weight:600; }
-  /* Orange border (text stays default) */
+  /* Orange border (only border, not text) */
   .hero select {
     min-width:280px; border:2px solid var(--orange); border-radius:12px; padding:10px 12px; background:#fff; color:inherit;
   }
@@ -398,7 +461,6 @@ function toggleTopicPanel() {
 }
 
 async function boot() {
-  // Populate both dropdowns
   const types = await fetch('/types').then(r=>r.json()).then(d=>d.types||[]);
   const selHero = document.getElementById('typeHero');
   const selTop  = document.getElementById('typeSelect');
@@ -419,24 +481,17 @@ async function boot() {
 
 function handleTypeChange(value, fromHero) {
   SELECTED_TYPE = value;
-  // Sync dropdowns + label
   document.getElementById('typeHero').value = value;
   document.getElementById('typeSelect').value = value;
   document.getElementById('topicText').textContent = (value==='General (All Types)') ? 'Shoulder' : value;
 
-  // Switch to chat view
   document.getElementById('hero').style.display = 'none';
   document.getElementById('topbar').style.display = 'flex';
   document.getElementById('chatContent').style.display = 'flex';
   document.getElementById('topicPanel').style.display = 'none';
 
-  // Fresh chat for the new type
   document.getElementById('chat').innerHTML = '';
-
-  // Type-scoped starter pills
   renderTypePills();
-
-  // Inform scope
   addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
 }
 
@@ -610,69 +665,37 @@ def ask(body: AskBody):
     selected_type = body.selected_type or "General (All Types)"
     SESSIONS[sid]["selected_type"] = selected_type
 
-    # Strict type filter
-    where = {}
-    if selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
-        where = {"type": selected_type}
+    # 1) Retrieval scoped to selected type
+    docs = _retrieve_scoped(q, n=5, selected_type=selected_type)
 
-    # Retrieve
+    # 1b) If nothing (or blank), single paraphrase retry (still doc-only)
+    if (not docs) or all((not (d or "").strip()) for d in docs):
+        q2 = _paraphrase_once(q)
+        if q2 and q2 != q:
+            docs = _retrieve_scoped(q2, n=5, selected_type=selected_type)
+
+    # 2) Build context
+    context = _build_context(docs, max_chars=1800)
+
+    # 3) Summarize strictly from context (old behavior)
+    answer_text = _summarize_from_context(q, context)
+
+    # 4) Verified flag (same semantics as old code)
+    verified = (answer_text.strip() != NO_MATCH_MESSAGE.strip())
+
+    # 5) Suggestions (try your sugg module; fall back to adaptive)
     try:
-        res = collection.query(
-            query_texts=[q],
-            n_results=6,
-            where=where if where else None,
-            include=["documents", "metadatas", "distances"]
-        )
-        docs = (res.get("documents") or [[]])[0]
-        dists = (res.get("distances") or [[]])[0]
-    except Exception as e:
-        return {"answer": f"Search failed: {type(e).__name__}: {e}", "pills": [], "unverified": False}
+        sugs = gen_suggestions(q, answer_text, topic="shoulder", k=4, avoid=[])
+        if not sugs:
+            raise ValueError("empty sugg")
+        pills = [s if s.endswith("?") else s + "?" for s in sugs][:4]
+    except Exception:
+        pills = adaptive_followups(q, answer_text, selected_type)
 
-    covered = likely_covered(q, docs, dists, dist_thresh=0.33)
-
-    # If we couldn't confidently cover, try a light paraphrase query to the DB (NO external info).
-    if not covered:
-        # Simple heuristic paraphrase for retrieval
-        alt_q = re.sub(r"\bwhat\s+are\s+the\s+", "", q, flags=re.I)
-        alt_q = re.sub(r"\bplease\s+", "", alt_q, flags=re.I).strip() or q
-        try:
-            res2 = collection.query(
-                query_texts=[alt_q],
-                n_results=6,
-                where=where if where else None,
-                include=["documents", "distances"]
-            )
-            docs2 = (res2.get("documents") or [[]])[0]
-            dists2 = (res2.get("distances") or [[]])[0]
-            if docs2:
-                # merge, keep unique, preserve order
-                seen = set()
-                merged = []
-                for d in (docs + docs2):
-                    if isinstance(d, str) and d.strip() and d not in seen:
-                        seen.add(d); merged.append(d)
-                docs = merged[:6]
-                covered = likely_covered(q, docs, dists2 or dists, dist_thresh=0.33)
-        except Exception:
-            pass
-
-    if docs and covered:
-        context = "\n\n---\n\n".join([d for d in docs[:3] if isinstance(d, str) and d.strip()])[:1800]
-        raw = summarize_from_context(q, context)
-        if raw.strip() == "NO_MATCH":
-            answer_text = "I couldn’t find this answered in the clinic’s provided materials."
-            unverified = True
-        else:
-            answer_text = raw
-            unverified = False
-    else:
-        answer_text = "I couldn’t find this answered in the clinic’s provided materials."
-        unverified = True
-
-    pills = adaptive_followups(q, answer_text, selected_type)
+    # Store assistant message
     SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
 
-    return {"answer": answer_text, "pills": pills, "unverified": unverified, "session_id": sid}
+    return {"answer": answer_text, "pills": pills, "unverified": (not verified), "session_id": sid}
 
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
