@@ -26,13 +26,11 @@ os.makedirs(INDEX_DIR, exist_ok=True)
 def _mk_chroma():
     """
     Try persistent storage first (best on Railway), then fall back to in-memory if anything fails.
-    This prevents boot crashes if the image/glibc/duckdb combo is finicky.
     """
     try:
         client = chromadb.PersistentClient(path=INDEX_DIR)
         mode = "persistent"
     except Exception as e:
-        # Final fallback: in-memory client (no disk)
         try:
             client = chromadb.Client()
             mode = "memory"
@@ -44,7 +42,7 @@ def _mk_chroma():
 
 chroma_client, CHROMA_MODE = _mk_chroma()
 
-# Embeddings (don’t crash if key missing — retrieval still works because Chroma will call the embedder at query time)
+# Embeddings
 ef = embedding_functions.OpenAIEmbeddingFunction(
     api_key=OPENAI_API_KEY or None, model_name="text-embedding-3-small"
 )
@@ -57,7 +55,6 @@ try:
         metadata={"hnsw:space": "cosine"}
     )
 except Exception as e:
-    # Ultra-safe fallback: create a dummy no-embed collection that won’t crash app start
     print(f"[WARN] get_or_create_collection failed ({type(e).__name__}: {e}); retrying basic collection.", file=sys.stderr)
     collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
@@ -472,7 +469,289 @@ def ask(body: AskBody):
     SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
     return {"answer": answer_text, "pills": pills, "unverified": (not verified), "session_id": sid}
 
-# ========= UI (unchanged) =========
+# ========= UI (your exact block) =========
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return HTMLResponse("""<!doctype html> ... (your exact UI block stays the same from your current file) ... """)
+    # Plain triple-quoted string (NOT f-string) to avoid brace escaping issues.
+    return HTMLResponse("""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Patient Education</title>
+<style>
+  :root {
+    --bg:#fff; --text:#0b0b0c; --muted:#6b7280; --border:#eaeaea;
+    --chip:#f6f6f6; --chip-border:#d9d9d9; --pill-border:#dbdbdb;
+    --accent:#0a84ff; --orange:#ff7a18; --orange-soft:#ffe8d6;
+    --sidebar-w: 15rem;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font-family: "SF Pro Text","SF Pro Display",-apple-system,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }
+
+  /* Sidebar */
+  .sidebar { border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }
+  .new-chat {
+    display:block; width:100%; padding:10px 12px; margin-bottom:14px;
+    border:1px solid var(--border); border-radius:12px; background:#fff; cursor:pointer; font-weight:600;
+  }
+  .side-title { font-size:13px; font-weight:600; color:#333; margin:6px 0 8px; }
+  .skeleton { height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%; }
+  .skeleton:nth-child(2) { width:70%; } .skeleton:nth-child(3) { width:60%; }
+
+  /* Main */
+  .main { display:flex; flex-direction:column; min-width:0; }
+
+  /* HERO (Welcome) */
+  .hero { flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }
+  .hero-inner { text-align:center; max-width:820px; }
+  .hero .badge {
+    display:inline-block; padding:6px 12px; border-radius:999px; background:var(--orange-soft); color:#9a4b00;
+    font-weight:700; font-size:12px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:14px;
+  }
+  .hero h1 {
+    font-size: clamp(36px, 4.6vw, 52px);
+    line-height:1.08; margin:0 0 14px; font-weight:800; letter-spacing:-0.02em;
+    color:#000; /* full black */
+  }
+  .hero p { color:var(--muted); margin:0 0 22px; font-size:16px; }
+  .hero .selector { display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }
+  .hero label { color:#111; font-weight:600; }
+  /* Orange border (only border, not text) */
+  .hero select {
+    min-width:280px; border:2px solid var(--orange); border-radius:12px; padding:10px 12px; background:#fff; color:inherit;
+  }
+
+  /* TOPBAR (chat view) */
+  .topbar { display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }
+  .title { font-size:22px; font-weight:700; letter-spacing:.2px; }
+  .topic-chip {
+    position:absolute; right:18px; top:12px;
+    background:var(--chip); border:1px solid var(--chip-border); color:#333;
+    padding:8px 14px; border-radius:999px; font-size:13px; display:flex; align-items:center; gap:8px; cursor:pointer;
+  }
+  .topic-panel {
+    position:absolute; right:18px; top:52px; background:#fff; border:1px solid var(--border);
+    border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:10px; display:none; z-index:10;
+  }
+  .topic-panel select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }
+
+  .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+  .chat-area { flex:1; overflow:auto; padding:18px 24px; }
+  .pills { display:flex; flex-wrap:wrap; gap:14px; padding:0 24px 12px; }
+  .pill {
+    border:1px solid var(--pill-border); background:#fff; padding:12px 16px; border-radius:999px;
+    font-size:16px; cursor:pointer; line-height:1; box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+  }
+  .bubble { max-width:820px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0; line-height:1.45; }
+  .bot { background:#fafafa; }
+  .user { background:#fff; margin-left:auto; border-color:#ddd; }
+
+  .composer-wrap { border-top:1px solid var(--border); padding:12px 24px; }
+  .composer {
+    display:flex; align-items:center; gap:10px; max-width:920px;
+    border:1px solid var(--border); border-radius:16px; padding:8px 12px; margin:0 auto;
+  }
+  .composer input { flex:1; border:none; outline:none; font-size:16px; padding:10px 12px; }
+  .fab {
+    width:42px; height:42px; border-radius:50%; background:#ff7a18;
+    display:flex; align-items:center; justify-content:center; cursor:pointer; border:none;
+  }
+  .fab svg { width:20px; height:20px; fill:#fff; }
+
+  .spinner {
+    width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color:#0a84ff;
+    animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <button class="new-chat" onclick="newChat()">+ New chat</button>
+    <div class="side-title">Previous Chats</div>
+    <div id="chats"></div>
+    <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
+  </aside>
+
+  <main class="main">
+    <!-- HERO (homescreen) -->
+    <section class="hero" id="hero">
+      <div class="hero-inner">
+        <div class="badge">Shoulder</div>
+        <h1>Welcome! Select the type of surgery below:</h1>
+        <p>Choose your specific shoulder arthroscopy to tailor answers and quick questions.</p>
+        <div class="selector">
+          <label for="typeHero">Type of Shoulder Arthroscopy</label>
+          <select id="typeHero"></select>
+        </div>
+      </div>
+    </section>
+
+    <!-- CHAT VIEW (after selection) -->
+    <div class="topbar" id="topbar">
+      <div class="title">Patient Education</div>
+      <div class="topic-chip" id="topicChip" onclick="toggleTopicPanel()">
+        <strong>Topic:</strong> <span class="sel" id="topicText">Shoulder</span>
+      </div>
+      <div class="topic-panel" id="topicPanel">
+        <select id="typeSelect"></select>
+      </div>
+    </div>
+
+    <div class="content" id="chatContent" style="display:none;">
+      <div class="chat-area" id="chat"></div>
+      <div class="pills" id="pills"></div>
+
+      <div class="composer-wrap">
+        <div class="composer">
+          <input id="q" placeholder="Ask about your shoulder..." onkeydown="if(event.key==='Enter') ask()"/>
+          <button class="fab" onclick="ask()" title="Send">
+            <svg viewBox="0 0 24 24"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.59 5.58L20 12l-8-8-8 8z"></path></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+let SESSION_ID = null;
+let SELECTED_TYPE = null;
+
+function toggleTopicPanel() {
+  const p = document.getElementById('topicPanel');
+  p.style.display = (p.style.display === 'block') ? 'none' : 'block';
+}
+
+async function boot() {
+  const types = await fetch('/types').then(r=>r.json()).then(d=>d.types||[]);
+  const selHero = document.getElementById('typeHero');
+  const selTop  = document.getElementById('typeSelect');
+  [selHero, selTop].forEach(sel => {
+    sel.innerHTML='';
+    types.forEach(t=>{
+      const o=document.createElement('option'); o.value=t; o.textContent=t; sel.appendChild(o);
+    });
+  });
+  selHero.value = "General (All Types)";
+
+  selHero.addEventListener('change', () => handleTypeChange(selHero.value, true));
+  selTop.addEventListener('change', () => handleTypeChange(selTop.value, false));
+
+  await listSessions();
+  await newChat(true);
+}
+
+function handleTypeChange(value, fromHero) {
+  SELECTED_TYPE = value;
+  document.getElementById('typeHero').value = value;
+  document.getElementById('typeSelect').value = value;
+  document.getElementById('topicText').textContent = (value==='General (All Types)') ? 'Shoulder' : value;
+
+  document.getElementById('hero').style.display = 'none';
+  document.getElementById('topbar').style.display = 'flex';
+  document.getElementById('chatContent').style.display = 'flex';
+  document.getElementById('topicPanel').style.display = 'none';
+
+  document.getElementById('chat').innerHTML = '';
+  renderTypePills();
+  addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
+}
+
+function renderTypePills() {
+  fetch('/pills?type=' + encodeURIComponent(SELECTED_TYPE))
+    .then(r=>r.json())
+    .then(data => {
+      const pills = data.pills || [];
+      const el = document.getElementById('pills'); el.innerHTML='';
+      pills.forEach(label => {
+        const b = document.createElement('button'); b.className='pill'; b.textContent=label;
+        b.onclick = () => { document.getElementById('q').value = label; ask(); };
+        el.appendChild(b);
+      });
+    });
+}
+
+async function listSessions() {
+  const data = await fetch('/sessions').then(r=>r.json());
+  const el = document.getElementById('chats'); el.innerHTML='';
+  data.sessions.forEach(s => {
+    const d = document.createElement('div'); d.style.cursor='pointer'; d.style.padding='6px 2px';
+    d.textContent = s.title || 'Untitled chat';
+    d.onclick = () => loadSession(s.id);
+    el.appendChild(d);
+  });
+}
+
+async function newChat(silent=false) {
+  const data = await fetch('/sessions/new', {method:'POST'}).then(r=>r.json());
+  SESSION_ID = data.session_id;
+  if(!silent) addBot('New chat started. Select a surgery type to begin.');
+  await listSessions();
+}
+
+async function loadSession(id) {
+  const data = await fetch('/sessions/'+id).then(r=>r.json());
+  SESSION_ID = id;
+  const chat = document.getElementById('chat'); chat.innerHTML='';
+  data.messages.forEach(m => { if(m.role==='user') addUser(m.content); else addBot(m.content); });
+}
+
+function addUser(text) {
+  const d = document.createElement('div'); d.className='bubble user'; d.textContent=text;
+  document.getElementById('chat').appendChild(d); scrollBottom();
+}
+function addBot(htmlText) {
+  const d = document.createElement('div'); d.className='bubble bot'; d.innerHTML=htmlText;
+  document.getElementById('chat').appendChild(d); scrollBottom();
+}
+function spinner() {
+  const d = document.createElement('div'); d.className='bubble bot';
+  d.innerHTML='Thinking <span class="spinner"></span>';
+  document.getElementById('chat').appendChild(d); scrollBottom(); return d;
+}
+function scrollBottom() {
+  const el = document.getElementById('chat'); el.scrollTop = el.scrollHeight;
+}
+
+async function ask() {
+  const q = document.getElementById('q').value.trim();
+  if(!q) return;
+  if(!SELECTED_TYPE) { addBot('Please select a surgery type first.'); return; }
+  addUser(q); document.getElementById('q').value='';
+  const spin = spinner();
+  const body = {question:q, session_id:SESSION_ID, selected_type:SELECTED_TYPE};
+  const data = await fetch('/ask', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+  }).then(r=>r.json());
+  spin.remove();
+  addBot(data.answer);
+
+  if(data.pills && data.pills.length) {
+    const el = document.getElementById('pills'); el.innerHTML='';
+    data.pills.forEach(label => {
+      const b = document.createElement('button'); b.className='pill'; b.textContent=label;
+      b.onclick = () => { document.getElementById('q').value = label; ask(); };
+      el.appendChild(b);
+    });
+  }
+
+  if(data.unverified) {
+    addBot('<div style="color:#6b7280;font-size:12px;margin-top:6px;">This information is not verified by the clinic; please contact your provider with questions.</div>');
+  }
+
+  await listSessions();
+}
+
+boot();
+</script>
+</body>
+</html>
+    """)
