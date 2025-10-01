@@ -18,7 +18,7 @@ except Exception:
         return {"blocked": False, "reasons": []}
 
 try:
-    from .sugg import gen_suggestions  # optional; we still have adaptive pills fallback
+    from .sugg import gen_suggestions  # optional; we'll fallback if missing
 except Exception:
     def gen_suggestions(q, answer, topic=None, k=4, avoid=None):
         return []
@@ -52,7 +52,7 @@ PROCEDURE_TYPES = {
     "SLAP Repair": ["slap tear", "superior labrum", "biceps anchor", "type ii slap", "labral superior", "slap repair"],
     "Bankart (Anterior Labrum) Repair": ["bankart", "anterior labrum", "anterior instability", "glenoid labrum anterior"],
     "Posterior Labrum Repair": ["posterior labrum", "posterior instability", "reverse bankart"],
-    "Biceps Tenodesis/Tenotomy": ["biceps tenodesis", "tenotomy", "biceps tendon", "lhb", "biceps tendinopathy"],
+    "Biceps Tenodesis/Tenotomy": ["biceps tenodesis", "tenotomy", "biceps tendon", "lhb", "biceps tendinopathy", "tenodesis/tenotomy"],
     "Subacromial Decompression (SAD)": ["subacromial decompression", "acromioplasty", "impingement", "s.a.d"],
     "Distal Clavicle Excision": ["distal clavicle excision", "dce", "mumford", "ac joint resection"],
     "Capsular Release": ["capsular release", "adhesive capsulitis", "frozen shoulder", "arthroscopic release"],
@@ -125,7 +125,7 @@ PROCEDURE_PILLS: Dict[str, List[str]] = {
 
 # ========= INGEST HELPERS =========
 def classify_chunk(text: str) -> str:
-    t = text.lower()
+    t = (text or "").lower()
     best = "General (All Types)"
     best_hits = 0
     for k, kws in PROCEDURE_TYPES.items():
@@ -152,7 +152,7 @@ def chunk_docx(file_bytes: bytes) -> List[str]:
         i += size - overlap
     return chunks
 
-# ========= “OLD VERSION” ANSWERING HELPERS (ported verbatim in spirit) =========
+# ========= “OLD VERSION” ANSWERING HELPERS (plus improved retrieval) =========
 NO_MATCH_MESSAGE = (
     "I couldn’t find this answered in the clinic’s provided materials. "
     "You can try rephrasing your question, or ask your clinician directly."
@@ -182,25 +182,70 @@ def _paraphrase_once(q: str) -> str:
     except Exception:
         return q
 
-def _retrieve_scoped(q: str, n: int = 5, selected_type: Optional[str] = None) -> List[str]:
-    """Retrieval scoped by procedure type metadata."""
+def _keyword_hits(txt: str, selected_type: str) -> int:
+    kws = PROCEDURE_TYPES.get(selected_type, [])
+    if not kws:
+        return 0
+    t = (txt or "").lower()
+    return sum(1 for kw in kws if kw in t)
+
+def _retrieve_scoped(q: str, n: int, selected_type: Optional[str]) -> List[str]:
+    """
+    Two-stage hybrid retrieval:
+    1) Augmented query scoped to selected type (if not 'General').
+    2) If weak, widen to global and re-rank by keyword hits to pull the right procedure text
+       even if it was tagged General during ingest.
+    """
+    # Augmented query adds strong procedure hints to the embedding
+    kw = " ".join(PROCEDURE_TYPES.get(selected_type, []))
+    q_aug = f"{q}\nSurgery type: {selected_type or 'General'}\nKeywords: {kw}".strip()
+
+    docs: List[str] = []
     try:
-        kwargs = {"query_texts": [q], "n_results": n}
+        kwargs = {"query_texts": [q_aug], "n_results": max(8, n)}
         if selected_type and selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
             kwargs["where"] = {"type": selected_type}
-        res = collection.query(**kwargs)
-        return res.get("documents", [[]])[0]
+        resA = collection.query(**kwargs)
+        docsA = (resA.get("documents") or [[]])[0]
+        docs.extend([d for d in docsA if isinstance(d, str) and d.strip()])
     except Exception:
-        return []
+        pass
 
-def _build_context(docs: List[str], max_chars: int = 1800) -> str:
-    clean_docs = [_normalize(d) for d in docs[:3] if isinstance(d, str) and d.strip()]
+    # If not confident, widen and re-rank by keyword hits
+    if len(docs) < 3:
+        try:
+            resB = collection.query(query_texts=[q_aug], n_results=max(12, n))
+            docsB = (resB.get("documents") or [[]])[0]
+            scored = [(d, _keyword_hits(d, selected_type or "")) for d in docsB if isinstance(d, str) and d.strip()]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            docs_wide = [d for d, _ in scored]
+            seen, merged = set(), []
+            for d in (docs + docs_wide):
+                if d not in seen:
+                    seen.add(d); merged.append(d)
+            docs = merged
+        except Exception:
+            pass
+
+    return docs[:max(n, 8)]
+
+def _build_context(docs: List[str], max_chars: int = 2600) -> str:
+    clean_docs = [_normalize(d) for d in docs[:5] if isinstance(d, str) and d.strip()]
     context = "\n\n---\n\n".join(clean_docs)
     return context[:max_chars] if context else ""
 
 def _summarize_from_context(q: str, context: str) -> str:
     if not context:
         return NO_MATCH_MESSAGE
+
+    # Gentle intent hint for generic questions
+    hint = ""
+    lowq = (q or "").lower()
+    if "risk" in lowq:
+        hint = " Focus on procedure-specific risks described in the material."
+    elif "recover" in lowq or "return" in lowq or "heal" in lowq:
+        hint = " Focus on recovery timelines, milestones, and restrictions from the material."
+
     msgs = [
         {
             "role": "system",
@@ -215,7 +260,7 @@ def _summarize_from_context(q: str, context: str) -> str:
                 "You can try rephrasing your question, or ask your clinician directly."
             ),
         },
-        {"role": "user", "content": f"Question: {q}\n\nMaterial:\n{context}"},
+        {"role": "user", "content": f"Question: {q}{hint}\n\nMaterial:\n{context}"},
     ]
     try:
         resp = client.chat.completions.create(
@@ -227,7 +272,6 @@ def _summarize_from_context(q: str, context: str) -> str:
     except Exception:
         return NO_MATCH_MESSAGE
 
-# ========= ADAPTIVE PILLS =========
 def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str]:
     last = (last_q or "").lower()
     base = PROCEDURE_PILLS.get(selected_type or "General (All Types)", PROCEDURE_PILLS["General (All Types)"])
@@ -268,17 +312,6 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
         ]
     return base[:4]
 
-def likely_covered(question: str, docs: List[str], dist_thresh: float = 0.35) -> bool:
-    if not docs:
-        return False
-    # token overlap heuristic
-    q_tokens = set(re.findall(r"[a-z]{3,}", question.lower()))
-    for d in docs[:3]:
-        d_tokens = set(re.findall(r"[a-z]{3,}", (d or "").lower()))
-        if len(q_tokens & d_tokens) >= 3:
-            return True
-    return False
-
 # ========= FASTAPI APP =========
 app = FastAPI(title="Patient Education")
 app.add_middleware(
@@ -298,10 +331,10 @@ class AskBody(BaseModel):
     session_id: Optional[str] = None
     selected_type: Optional[str] = None
 
-# ========= UI (Welcome + Chat) =========
+# ========= UI (Welcome + Chat preserved) =========
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Plain triple-quoted string (NOT f-string) so CSS/JS braces don't crash Python.
+    # Plain triple-quoted string (NOT f-string) to avoid brace escaping issues.
     return HTMLResponse("""
 <!doctype html>
 <html lang="en">
@@ -319,7 +352,6 @@ def home():
   * { box-sizing:border-box; }
   body {
     margin:0; background:var(--bg); color:var(--text);
-    /* Slightly cleaner font stack for welcome */
     font-family: "SF Pro Text","SF Pro Display",-apple-system,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   }
   .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }
@@ -665,25 +697,19 @@ def ask(body: AskBody):
     selected_type = body.selected_type or "General (All Types)"
     SESSIONS[sid]["selected_type"] = selected_type
 
-    # 1) Retrieval scoped to selected type
-    docs = _retrieve_scoped(q, n=5, selected_type=selected_type)
-
-    # 1b) If nothing (or blank), single paraphrase retry (still doc-only)
+    # === Improved Retrieval ===
+    docs = _retrieve_scoped(q, n=10, selected_type=selected_type)
     if (not docs) or all((not (d or "").strip()) for d in docs):
         q2 = _paraphrase_once(q)
         if q2 and q2 != q:
-            docs = _retrieve_scoped(q2, n=5, selected_type=selected_type)
+            docs = _retrieve_scoped(q2, n=10, selected_type=selected_type)
 
-    # 2) Build context
-    context = _build_context(docs, max_chars=1800)
-
-    # 3) Summarize strictly from context (old behavior)
+    context = _build_context(docs, max_chars=2600)
     answer_text = _summarize_from_context(q, context)
 
-    # 4) Verified flag (same semantics as old code)
     verified = (answer_text.strip() != NO_MATCH_MESSAGE.strip())
 
-    # 5) Suggestions (try your sugg module; fall back to adaptive)
+    # Suggestions (try module; fallback to adaptive)
     try:
         sugs = gen_suggestions(q, answer_text, topic="shoulder", k=4, avoid=[])
         if not sugs:
@@ -692,7 +718,6 @@ def ask(body: AskBody):
     except Exception:
         pills = adaptive_followups(q, answer_text, selected_type)
 
-    # Store assistant message
     SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
 
     return {"answer": answer_text, "pills": pills, "unverified": (not verified), "session_id": sid}
