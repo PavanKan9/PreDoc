@@ -266,15 +266,14 @@ def expand_query_variants(q: str, selected_type: Optional[str]) -> List[str]:
 def _retrieve_rich(queries: List[str], n: int, topic: Optional[str], selected_type: Optional[str]):
     seen = set()
     results: List[Tuple[str, Dict[str,Any], str, float]] = []
-    where: Dict[str, Any] = {}
-    if topic: where["topic"] = topic
     where_type = {"type": selected_type} if (selected_type and selected_type != "General (All Types)") else None
 
     def _do_query(q, restrict_type):
         kwargs = {"query_texts":[q], "n_results": max(8,n)}
-        if topic: kwargs["where"] = {"topic": topic}
+        where = {"topic": "shoulder"}
         if restrict_type and where_type:
-            kwargs["where"] = {"topic": topic, "type": selected_type}
+            where["type"] = selected_type
+        kwargs["where"] = where
         try:
             res = collection.query(**kwargs)
         except Exception as e:
@@ -619,7 +618,7 @@ def ask(body: AskBody):
         sugs = gen_suggestions(q_raw, answer_text, topic="shoulder", k=3, avoid=[])
         if not sugs:
             raise ValueError("empty sugg")
-        pills = [s if s.endsWith("?") else s + "?" for s in sugs][:3]  # guard
+        pills = [s if s.endswith("?") else s + "?" for s in sugs][:3]
     except Exception:
         pills = adaptive_followups(q_raw, answer_text, selected_type)
 
@@ -641,22 +640,29 @@ def home():
     --bg:#fff; --text:#0b0b0c; --muted:#6b7280; --border:#eaeaea;
     --chip:#f6f6f6; --chip-border:#d9d9d9; --pill-border:#dbdbdb;
     --accent:#0a84ff; --orange:#ff7a18; --orange-soft:#ffe8d6;
-    --sidebar-w: 15rem;
+    --sidebar-w: 15rem; --sidebar-bg:#f7f7f8; /* ChatGPT-like grey */
   }
   * { box-sizing:border-box; }
   body {
     margin:0; background:var(--bg); color:var(--text);
-    font-family: "SF Pro Text","SF Pro Display",-apple-system,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    /* ChatGPT-like font stack */
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                 Roboto, "Helvetica Neue", Arial, "Noto Sans",
+                 "Apple Color Emoji", "Segoe UI Emoji";
   }
   .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }
 
-  /* Sidebar */
-  .sidebar { border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }
+  /* Sidebar (grey like ChatGPT) */
+  .sidebar {
+    background: var(--sidebar-bg);
+    border-right:1px solid var(--border);
+    padding:16px 14px; overflow:auto;
+  }
   .home-logo { display:flex; align-items:center; justify-content:center; padding:6px 4px 10px; cursor:pointer; user-select:none; }
   .home-logo img { width:100%; max-width: 200px; height:auto; object-fit:contain; }
   .new-chat { display:block; width:100%; padding:10px 12px; margin-bottom:14px; border:1px solid var(--border); border-radius:12px; background:#fff; cursor:pointer; font-weight:600; }
   .side-title { font-size:13px; font-weight:600; color:#333; margin:6px 0 8px; }
-  .skeleton { height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%; }
+  .skeleton { height:10px; background:#efefef; border-radius:8px; margin:10px 0; width:80%; }
   .skeleton:nth-child(2) { width:70%; } .skeleton:nth-child(3) { width:60%; }
 
   /* Main */
@@ -675,7 +681,7 @@ def home():
   /* TOPBAR (chat view) */
   .topbar { display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }
   .title { font-size:22px; font-weight:700; letter-spacing:.2px; }
-  .topic-chip { position:absolute; right:18px; top:12px; background:var(--chip); border:1px solid var(--chip-border); color:#333; padding:8px 14px; border-radius:999px; font-size:13px; display:flex; align-items:center; gap:8px; cursor:pointer; }
+  .topic-chip { position:absolute; right:18px; top:12px; background:#fff; border:1px solid var(--chip-border); color:#333; padding:8px 14px; border-radius:999px; font-size:13px; display:flex; align-items:center; gap:8px; cursor:pointer; }
   .topic-panel { position:absolute; right:18px; top:52px; background:#fff; border:1px solid var(--border); border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:10px; display:none; z-index:10; }
   .topic-panel select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }
 
@@ -697,7 +703,7 @@ def home():
   /* Composer locked to column width */
   .composer-wrap { border-top:1px solid var(--border); }
   .composer-row { max-width:780px; margin: 0 auto; padding:12px 24px; }
-  .composer { display:flex; align-items:center; gap:10px; width:100%; border:1px solid var(--border); border-radius:16px; padding:8px 12px; }
+  .composer { display:flex; align-items:center; gap:10px; width:100%; border:1px solid var(--border); border-radius:16px; padding:8px 12px; background:#fff; }
   .composer input { flex:1; border:none; outline:none; font-size:16px; padding:10px 12px; }
   .fab { width:42px; height:42px; border-radius:50%; background:var(--orange); display:flex; align-items:center; justify-content:center; cursor:pointer; border:none; }
   .fab svg { width:20px; height:20px; fill:#fff; }
@@ -816,7 +822,7 @@ function handleTypeChange(value, fromHero) {
 
   document.getElementById('chat').innerHTML = '';
   renderTypePills();
-  addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
+  // Removed the old: addBot('Filtering to “...” ...')
 }
 
 function renderTypePills() {
