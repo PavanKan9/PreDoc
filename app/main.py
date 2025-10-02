@@ -174,7 +174,7 @@ PROCEDURE_PILLS: Dict[str, List[str]] = {
 # === Acronym & synonyms ===
 ACRONYM_MAP = {
     "dce": "distal clavicle excision",
-    "sad": "subacromial decompression",    # <- ensure SAD never becomes Seasonal Affective Disorder
+    "sad": "subacromial decompression",    # force SAD to the shoulder procedure
     "rcr": "rotator cuff repair",
     "acr": "acromioplasty",
     "bt": "biceps tenodesis",
@@ -189,7 +189,7 @@ SYN_EXPAND = {
     "bench": ["press","lifting"],
 }
 
-# Add type-specific bias terms to favor correct chunks
+# Bias terms to favor correct chunks per selected type
 TYPE_BIASES = {
     "Subacromial Decompression (SAD)": ["subacromial","acromion","acromioplasty","decompression","impingement","sad"],
     "Distal Clavicle Excision": ["distal clavicle","ac joint","mumford","resection","dce"],
@@ -232,32 +232,28 @@ def _tokens(s: str) -> set:
 
 def expand_query_variants(q: str, selected_type: Optional[str]) -> List[str]:
     low = q.lower().strip()
-
-    # Expand acronyms regardless of spacing
+    # Expand acronyms
     for a, full in ACRONYM_MAP.items():
         if re.search(rf"\b{re.escape(a)}\b", low):
             low += f" ({full})"
-
     variants = {q, low}
-
+    # Synonyms
     for k, arr in SYN_EXPAND.items():
         if k in low:
             for alt in arr:
                 variants.add(low.replace(k, alt))
-
-    # add type bias into queries to force relevant retrieval
+    # Type bias terms
     if selected_type and selected_type in TYPE_BIASES:
         for tok in TYPE_BIASES[selected_type]:
             variants.add(low + f" {tok}")
-
-    # one paraphrase attempt
+    # One paraphrase attempt
     if client:
         try:
             r = client.chat.completions.create(
                 model="gpt-4o-mini",
                 temperature=0,
                 messages=[
-                    {"role": "system", "content": "Rewrite the question using common orthopedic terminology and acronyms; keep meaning the same."},
+                    {"role": "system", "content": "Rewrite the question using orthopedic terminology and acronyms; keep meaning the same."},
                     {"role": "user", "content": q},
                 ],
             )
@@ -265,7 +261,6 @@ def expand_query_variants(q: str, selected_type: Optional[str]) -> List[str]:
             if p: variants.add(p)
         except Exception:
             pass
-
     return list(variants)[:8]
 
 def _retrieve_rich(queries: List[str], n: int, topic: Optional[str], selected_type: Optional[str]):
@@ -273,13 +268,8 @@ def _retrieve_rich(queries: List[str], n: int, topic: Optional[str], selected_ty
     results: List[Tuple[str, Dict[str,Any], str, float]] = []
     where: Dict[str, Any] = {}
     if topic: where["topic"] = topic
-    # only pre-filter by type if specified; we’ll also re-rank
-    if selected_type and selected_type != "General (All Types)":
-        where_type = {"type": selected_type}
-    else:
-        where_type = None
+    where_type = {"type": selected_type} if (selected_type and selected_type != "General (All Types)") else None
 
-    # helper to query with/without type filter
     def _do_query(q, restrict_type):
         kwargs = {"query_texts":[q], "n_results": max(8,n)}
         if topic: kwargs["where"] = {"topic": topic}
@@ -295,7 +285,6 @@ def _retrieve_rich(queries: List[str], n: int, topic: Optional[str], selected_ty
         ids = res.get("ids", [[]])[0]
         return list(zip(docs, metas, ids))
 
-    # try with type restriction first (if any), then without
     for q in queries:
         for restrict in (True, False):
             for d, m, _id in _do_query(q, restrict):
@@ -304,7 +293,6 @@ def _retrieve_rich(queries: List[str], n: int, topic: Optional[str], selected_ty
                 seen.add(_id)
                 results.append((d, m or {}, _id, 0.0))
 
-    # simple rerank: token overlap + type bias + explicit bias terms in text
     bias_terms = set(TYPE_BIASES.get(selected_type or "", []))
     qtoks = _tokens(" ".join(queries))
     def score(item):
@@ -557,7 +545,6 @@ def ask(body: AskBody):
 
     # Coverage check
     if not context_covers_question(q_raw, context):
-        # external fallback that still respects selected type if provided
         external_answer = ""
         if client:
             try:
@@ -592,7 +579,7 @@ def ask(body: AskBody):
     if forbidden_if_not_in_context(answer_text, context):
         answer_text = NO_MATCH_MESSAGE
 
-    # If still no doc-grounded answer, try paraphrase again; else external
+    # Second attempt if needed
     if answer_text.strip() == NO_MATCH_MESSAGE.strip():
         queries2 = expand_query_variants(q_raw, selected_type)
         pairs2 = _retrieve_rich(queries2, n=12, topic="shoulder", selected_type=selected_type)
@@ -609,7 +596,6 @@ def ask(body: AskBody):
         src_line = "— Source: Clinic materials [" + ", ".join(used_sources[:3]) + "]"
         answer_text += f'<div style="color:#6b7280;font-size:12px;margin-top:6px;">{src_line}</div>'
     elif not verified:
-        # external fallback
         external_answer = ""
         if client:
             try:
@@ -633,7 +619,7 @@ def ask(body: AskBody):
         sugs = gen_suggestions(q_raw, answer_text, topic="shoulder", k=3, avoid=[])
         if not sugs:
             raise ValueError("empty sugg")
-        pills = [s if s.endswith("?") else s + "?" for s in sugs][:3]
+        pills = [s if s.endsWith("?") else s + "?" for s in sugs][:3]  # guard
     except Exception:
         pills = adaptive_followups(q_raw, answer_text, selected_type)
 
@@ -668,10 +654,7 @@ def home():
   .sidebar { border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }
   .home-logo { display:flex; align-items:center; justify-content:center; padding:6px 4px 10px; cursor:pointer; user-select:none; }
   .home-logo img { width:100%; max-width: 200px; height:auto; object-fit:contain; }
-  .new-chat {
-    display:block; width:100%; padding:10px 12px; margin-bottom:14px;
-    border:1px solid var(--border); border-radius:12px; background:#fff; cursor:pointer; font-weight:600;
-  }
+  .new-chat { display:block; width:100%; padding:10px 12px; margin-bottom:14px; border:1px solid var(--border); border-radius:12px; background:#fff; cursor:pointer; font-weight:600; }
   .side-title { font-size:13px; font-weight:600; color:#333; margin:6px 0 8px; }
   .skeleton { height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%; }
   .skeleton:nth-child(2) { width:70%; } .skeleton:nth-child(3) { width:60%; }
@@ -682,10 +665,7 @@ def home():
   /* HERO (Welcome) */
   .hero { flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }
   .hero-inner { text-align:center; max-width:820px; }
-  .hero .badge {
-    display:inline-block; padding:6px 12px; border-radius:999px; background:var(--orange-soft); color:#9a4b00;
-    font-weight:700; font-size:12px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:14px;
-  }
+  .hero .badge { display:inline-block; padding:6px 12px; border-radius:999px; background:var(--orange-soft); color:#9a4b00; font-weight:700; font-size:12px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:14px; }
   .hero h1 { font-size: clamp(36px, 4.6vw, 52px); line-height:1.08; margin:0 0 14px; font-weight:800; letter-spacing:-0.02em; color:#000; }
   .hero p { color:var(--muted); margin:0 0 22px; font-size:16px; }
   .hero .selector { display:flex; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; }
@@ -695,67 +675,34 @@ def home():
   /* TOPBAR (chat view) */
   .topbar { display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }
   .title { font-size:22px; font-weight:700; letter-spacing:.2px; }
-  .topic-chip {
-    position:absolute; right:18px; top:12px;
-    background:var(--chip); border:1px solid var(--chip-border); color:#333;
-    padding:8px 14px; border-radius:999px; font-size:13px; display:flex; align-items:center; gap:8px; cursor:pointer;
-  }
-  .topic-panel {
-    position:absolute; right:18px; top:52px; background:#fff; border:1px solid var(--border);
-    border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:10px; display:none; z-index:10;
-  }
+  .topic-chip { position:absolute; right:18px; top:12px; background:var(--chip); border:1px solid var(--chip-border); color:#333; padding:8px 14px; border-radius:999px; font-size:13px; display:flex; align-items:center; gap:8px; cursor:pointer; }
+  .topic-panel { position:absolute; right:18px; top:52px; background:#fff; border:1px solid var(--border); border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:10px; display:none; z-index:10; }
   .topic-panel select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }
 
   .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
 
   /* Chat column like ChatGPT: centered, single column */
   .chat-wrap { flex:1; overflow:auto; }
-  .chat-col {
-    max-width: 780px; margin: 0 auto; padding: 18px 24px;
-    display:flex; flex-direction:column; gap:10px;
-  }
+  .chat-col { max-width: 780px; margin: 0 auto; padding: 18px 24px; display:flex; flex-direction:column; gap:10px; }
 
-  /* Pills: 3-column grid, full width of chat column */
-  .pills {
-    display:grid; grid-template-columns: repeat(3, minmax(0,1fr));
-    gap:12px; padding:0; margin-bottom:8px;
-  }
-  .pill {
-    display:inline-flex; align-items:center; justify-content:center;
-    border:1px solid var(--pill-border); background:#fff; padding:12px 14px; border-radius:999px;
-    font-size:15px; cursor:pointer; line-height:1.2; min-height:44px; text-align:center;
-    white-space:normal; word-break:break-word;
-  }
+  /* Pills ABOVE the search bar (3-column grid) */
+  .pills { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:12px; margin-bottom:10px; }
+  .pill { display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--pill-border); background:#fff; padding:12px 14px; border-radius:999px; font-size:15px; cursor:pointer; line-height:1.2; min-height:44px; text-align:center; white-space:normal; word-break:break-word; }
 
-  /* Bubbles sit inside the centered column; align left/right without creating big gaps */
-  .bubble {
-    padding:12px 14px; border:1px solid var(--border); border-radius:14px; line-height:1.45;
-    width: fit-content; max-width:100%;
-  }
+  /* Bubbles inside centered column; align left/right */
+  .bubble { padding:12px 14px; border:1px solid var(--border); border-radius:14px; line-height:1.45; width: fit-content; max-width:100%; }
   .bot  { background:#fafafa; align-self:flex-start; }
   .user { background:#fff; align-self:flex-end; border-color:#ddd; }
 
   /* Composer locked to column width */
   .composer-wrap { border-top:1px solid var(--border); }
-  .composer-row {
-    max-width:780px; margin: 0 auto; padding:12px 24px;
-  }
-  .composer {
-    display:flex; align-items:center; gap:10px; width:100%;
-    border:1px solid var(--border); border-radius:16px; padding:8px 12px;
-  }
+  .composer-row { max-width:780px; margin: 0 auto; padding:12px 24px; }
+  .composer { display:flex; align-items:center; gap:10px; width:100%; border:1px solid var(--border); border-radius:16px; padding:8px 12px; }
   .composer input { flex:1; border:none; outline:none; font-size:16px; padding:10px 12px; }
-  .fab {
-    width:42px; height:42px; border-radius:50%; background:var(--orange);
-    display:flex; align-items:center; justify-content:center; cursor:pointer; border:none;
-  }
+  .fab { width:42px; height:42px; border-radius:50%; background:var(--orange); display:flex; align-items:center; justify-content:center; cursor:pointer; border:none; }
   .fab svg { width:20px; height:20px; fill:#fff; }
 
-  /* Spinner: ORANGE */
-  .spinner {
-    width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color: var(--orange);
-    animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px;
-  }
+  .spinner { width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color: var(--orange); animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px; }
   @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 </head>
@@ -798,13 +745,14 @@ def home():
 
     <div class="content" id="chatContent" style="display:none;">
       <div class="chat-wrap">
-        <div class="chat-col" id="chat">
-          <div class="pills" id="pills"></div>
-        </div>
+        <div class="chat-col" id="chat"></div>
       </div>
 
       <div class="composer-wrap">
         <div class="composer-row">
+          <!-- Pills now sit right above the search bar -->
+          <div class="pills" id="pills"></div>
+
           <div class="composer">
             <input id="q" placeholder="Ask about your shoulder..." onkeydown="if(event.key==='Enter') ask()"/>
             <button class="fab" onclick="ask()" title="Send">
@@ -832,7 +780,9 @@ function goHome() {
   document.getElementById('topbar').style.display = 'none';
   document.getElementById('chatContent').style.display = 'none';
   document.getElementById('topicPanel').style.display = 'none';
-  document.getElementById('chat').innerHTML = '<div class="pills" id="pills"></div>';
+  document.getElementById('chat').innerHTML = '';
+  const selHero = document.getElementById('typeHero');
+  if (selHero && selHero.options.length) selHero.value = "General (All Types)";
 }
 
 async function boot() {
@@ -864,8 +814,7 @@ function handleTypeChange(value, fromHero) {
   document.getElementById('chatContent').style.display = 'flex';
   document.getElementById('topicPanel').style.display = 'none';
 
-  const chat = document.getElementById('chat');
-  chat.innerHTML = '<div class="pills" id="pills"></div>';
+  document.getElementById('chat').innerHTML = '';
   renderTypePills();
   addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a pill.');
 }
@@ -908,7 +857,7 @@ async function loadSession(id) {
   document.getElementById('hero').style.display = 'none';
   document.getElementById('topbar').style.display = 'flex';
   document.getElementById('chatContent').style.display = 'flex';
-  const chat = document.getElementById('chat'); chat.innerHTML = '<div class="pills" id="pills"></div>';
+  const chat = document.getElementById('chat'); chat.innerHTML = '';
   data.messages.forEach(m => { if(m.role==='user') addUser(m.content); else addBot(m.content); });
 }
 
@@ -926,7 +875,8 @@ function spinner() {
   document.getElementById('chat').appendChild(d); scrollBottom(); return d;
 }
 function scrollBottom() {
-  const el = document.getElementById('chat'); el.parentElement.scrollTop = el.parentElement.scrollHeight;
+  const wrap = document.querySelector('.chat-wrap');
+  wrap.scrollTop = wrap.scrollHeight;
 }
 
 async function ask() {
