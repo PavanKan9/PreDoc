@@ -3,10 +3,10 @@ from fastapi import FastAPI, UploadFile, File, Query
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import os, io, re, uuid, sys
+from typing import List, Optional, Dict, Any, Tuple
+import os, io, re, uuid, sys, math
 
 # ---- OpenAI (graceful if missing key) ----
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -96,15 +96,15 @@ ALLOW_ORIGINS = [o.strip() for o in os.environ.get("ALLOW_ORIGINS", "*").split("
 # ========= PROCEDURE TYPES & PILLS =========
 PROCEDURE_TYPES: Dict[str, List[str]] = {
     "General (All Types)": [],
-    "Rotator Cuff Repair": ["rotator cuff", "supraspinatus", "infraspinatus", "subscapularis", "teres minor", "rc tear"],
-    "SLAP Repair": ["slap tear", "superior labrum", "biceps anchor", "type ii slap", "labral superior", "slap repair"],
-    "Bankart (Anterior Labrum) Repair": ["bankart", "anterior labrum", "anterior instability", "glenoid labrum anterior"],
-    "Posterior Labrum Repair": ["posterior labrum", "posterior instability", "reverse bankart"],
-    "Biceps Tenodesis/Tenotomy": ["biceps tenodesis", "tenotomy", "biceps tendon", "lhb", "biceps tendinopathy", "tenodesis/tenotomy"],
-    "Subacromial Decompression (SAD)": ["subacromial decompression", "acromioplasty", "impingement", "s.a.d"],
-    "Distal Clavicle Excision": ["distal clavicle excision", "dce", "mumford", "ac joint resection"],
-    "Capsular Release": ["capsular release", "adhesive capsulitis", "frozen shoulder", "arthroscopic release"],
-    "Debridement/Diagnostic Only": ["debridement", "diagnostic arthroscopy", "synovectomy"],
+    "Rotator Cuff Repair": ["rotator cuff","rcr","supraspinatus","infraspinatus","subscapularis","teres minor","rc tear"],
+    "SLAP Repair": ["slap tear","slap","superior labrum","biceps anchor","type ii slap","labral superior","slap repair"],
+    "Bankart (Anterior Labrum) Repair": ["bankart","anterior labrum","anterior instability","glenoid labrum anterior"],
+    "Posterior Labrum Repair": ["posterior labrum","posterior instability","reverse bankart"],
+    "Biceps Tenodesis/Tenotomy": ["biceps tenodesis","tenodesis","tenotomy","biceps tendon","lhb","biceps tendinopathy","tenodesis/tenotomy"],
+    "Subacromial Decompression (SAD)": ["subacromial decompression","sad","acromioplasty","impingement","s.a.d"],
+    "Distal Clavicle Excision": ["distal clavicle excision","dce","mumford","ac joint resection","distal clavicle resection"],
+    "Capsular Release": ["capsular release","adhesive capsulitis","frozen shoulder","arthroscopic release"],
+    "Debridement/Diagnostic Only": ["debridement","diagnostic arthroscopy","synovectomy"],
 }
 PROCEDURE_KEYS = list(PROCEDURE_TYPES.keys())
 
@@ -171,24 +171,40 @@ PROCEDURE_PILLS: Dict[str, List[str]] = {
     ],
 }
 
-def classify_chunk(text: str) -> str:
-    t = (text or "").lower()
-    best = "General (All Types)"
-    best_hits = 0
-    for k, kws in PROCEDURE_TYPES.items():
-        if not kws:
-            continue
-        hits = sum(1 for kw in kws if kw in t)
-        if hits > best_hits:
-            best_hits = hits
-            best = k
-    return best
+# === Acronym & synonym expansions ===
+ACRONYM_MAP = {
+    "dce": "distal clavicle excision",
+    "sad": "subacromial decompression",
+    "rcr": "rotator cuff repair",
+    "acr": "acromioplasty",
+    "tenodesis": "biceps tenodesis",
+    "bt": "biceps tenodesis",
+}
 
-# ========= Content helpers (strict grounding) =========
+SYN_EXPAND = {
+    "what is": ["define","explain","overview"],
+    "precaution": ["restriction","limit","avoid","contraindication"],
+    "therapy": ["pt","physical therapy","rehab","exercises"],
+    "instability": ["dislocation","subluxation"],
+    "pain": ["soreness","discomfort"],
+    "bench": ["press","lifting"],
+}
+
+# ========= Content helpers (strict grounding with smart recall) =========
 NO_MATCH_MESSAGE = (
     "I couldn’t find this answered in the clinic’s provided materials. "
     "You can try rephrasing your question, or ask your clinician directly."
 )
+
+FORBIDDEN_IF_NOT_IN_CONTEXT = {
+    "constipation","stool","stool softener","fiber","laxative","bananas",
+    "soups","white bread","processed foods","dairy","gas","bloating"
+}
+
+STOPWORDS = {
+    "a","an","the","and","or","to","of","for","in","on","with","after","before","is","are","be","do","does",
+    "can","i","my","me","you","your","what","how","when","which","should","will","it","that","this","than"
+}
 
 def _normalize(txt: str) -> str:
     if not isinstance(txt, str):
@@ -199,43 +215,117 @@ def _normalize(txt: str) -> str:
     t = re.sub(r"\s+", " ", t)
     return t.strip()
 
-def _paraphrase_once(q: str) -> str:
-    if not client:
-        return q
-    try:
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {"role": "system", "content": "Paraphrase the user's medical question in one sentence. Preserve meaning; don't add new claims."},
-                {"role": "user", "content": q},
-            ],
-        )
-        p = (r.choices[0].message.content or "").strip()
-        return p or q
-    except Exception:
-        return q
+def _tokens(s: str) -> set:
+    return {w for w in re.findall(r"[a-zA-Z]{3,}", (s or "").lower()) if w not in STOPWORDS}
 
-def _retrieve(q: str, n: int = 8, topic: Optional[str] = "shoulder", selected_type: Optional[str] = None):
-    try:
-        where: Dict[str, Any] = {}
-        if topic:
-            where["topic"] = topic
-        if selected_type and selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
-            where["type"] = selected_type
-        kwargs = {"query_texts": [q], "n_results": max(8, n)}
-        if where:
-            kwargs["where"] = where
-        res = collection.query(**kwargs)
-        return res.get("documents", [[]])[0]
-    except Exception as e:
-        print(f"[WARN] Retrieval failed: {e}", file=sys.stderr)
-        return []
+def expand_query_variants(q: str) -> List[str]:
+    low = q.lower().strip()
 
-def _build_context(docs: List[str], max_chars: int = 1800) -> str:
-    clean_docs = [_normalize(d) for d in docs[:5] if isinstance(d, str) and d.strip()]
-    context = "\n\n---\n\n".join(clean_docs)
-    return context[:max_chars] if context else ""
+    # expand acronyms
+    for a, full in ACRONYM_MAP.items():
+        if re.search(rf"\b{re.escape(a)}\b", low):
+            low += f" ({full})"
+
+    variants = {q, low}
+    # synonym expansions
+    for k, arr in SYN_EXPAND.items():
+        if k in low:
+            for alt in arr:
+                variants.add(low.replace(k, alt))
+
+    # simple procedure keywords injected
+    for k, kws in PROCEDURE_TYPES.items():
+        for kw in kws:
+            if kw in low:
+                variants.add(low)
+                break
+
+    # one paraphrase attempt
+    if client:
+        try:
+            r = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": "Rewrite the question using common medical terminology and acronyms; keep meaning the same."},
+                    {"role": "user", "content": q},
+                ],
+            )
+            p = (r.choices[0].message.content or "").strip()
+            if p: variants.add(p)
+        except Exception:
+            pass
+
+    return list(variants)[:6]
+
+def _retrieve_rich(queries: List[str], n: int = 8, topic: Optional[str] = "shoulder", selected_type: Optional[str] = None):
+    """Return list of (doc, meta, id)."""
+    seen = set()
+    results: List[Tuple[str, Dict[str,Any], str]] = []
+    where: Dict[str, Any] = {}
+    if topic:
+        where["topic"] = topic
+    if selected_type and selected_type in PROCEDURE_KEYS and selected_type != "General (All Types)":
+        where["type"] = selected_type
+
+    for q in queries:
+        try:
+            kwargs = {"query_texts":[q], "n_results": max(8,n)}
+            if where: kwargs["where"] = where
+            res = collection.query(**kwargs)
+            docs = res.get("documents", [[]])[0]
+            metas = res.get("metadatas", [[]])[0]
+            ids = res.get("ids", [[]])[0]
+            for d,m,i in zip(docs,metas,ids):
+                if not d or not str(d).strip(): continue
+                if i in seen: continue
+                seen.add(i)
+                results.append((d,m or {},i))
+        except Exception as e:
+            print(f"[WARN] Retrieval failed: {e}", file=sys.stderr)
+            continue
+
+    # simple rerank: keyword overlap + type match boost
+    def score(item):
+        d, m, _ = item
+        text = (d or "").lower()
+        base = sum(1 for tok in _tokens(" ".join(queries)) if tok in text)
+        if selected_type and (m.get("type")==selected_type): base += 2
+        return base
+    results.sort(key=score, reverse=True)
+    return results[:max(10,n)]
+
+def _build_context_and_sources(pairs: List[Tuple[str,Dict[str,Any],str]], max_chars: int = 2400):
+    ctx = []
+    src = []
+    total = 0
+    for d,m,_id in pairs:
+        nd = _normalize(d)
+        if not nd: continue
+        add = nd[: max(0, max_chars-total)]
+        if not add: break
+        ctx.append(add)
+        total += len(add)
+        if "source" in (m or {}): src.append(m["source"])
+        if total >= max_chars: break
+    context = "\n\n---\n\n".join(ctx)
+    unique_sources = sorted({s for s in src if s})
+    return context, unique_sources
+
+def context_covers_question(q: str, context: str) -> bool:
+    qtok = _tokens(q)
+    ctx = (context or "").lower()
+    hits = sum(1 for t in qtok if t in ctx)
+    strong = {"recovery","risk","precaution","therapy","exercise","motion","sling","instability","labrum","biceps","cuff","clavicle","acromion","decompression","tenodesis","tenotomy","debridement","capsulitis"}
+    return hits >= 1 or (qtok & strong)
+
+def forbidden_if_not_in_context(answer: str, context: str) -> bool:
+    a = (answer or "").lower()
+    c = (context or "").lower()
+    for term in FORBIDDEN_IF_NOT_IN_CONTEXT:
+        if term in a and term not in c:
+            return True
+    return False
 
 def _summarize_from_context(q: str, context: str) -> str:
     if not client:
@@ -245,17 +335,15 @@ def _summarize_from_context(q: str, context: str) -> str:
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.2,
+            temperature=0.15,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are a medical explainer. "
-                        "Write 2–3 clear sentences (45–80 words) using only the provided material. "
-                        "Start directly with the answer; do not refer to documents, material, context, sources, or clinics. "
-                        "Do not add pleasantries, introductions, or disclaimers. "
-                        "Use the document’s terminology when naming conditions or procedures. "
-                        "If the material does not answer the question, reply EXACTLY with: "
+                        "You are a medical explainer for orthopedic shoulder procedures. "
+                        "Use ONLY the provided material. Provide a concise, clinically accurate answer in 3–5 sentences. "
+                        "Prefer the document’s terminology; avoid speculative claims. "
+                        "No pleasantries or meta comments. If the material does not answer the question, reply EXACTLY with: "
                         "I couldn’t find this answered in the clinic’s provided materials. "
                         "You can try rephrasing your question, or ask your clinician directly."
                     ),
@@ -296,7 +384,7 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
         return ["How long should I expect pain after surgery?","What non-opioid options are used?","When should I taper medications?","What are red flags of uncontrolled pain?"]
     if re.search(r"\b(weeks?|months?|sling)\b", answer.lower()):
         return ["When do I start passive vs active motion?","When can I sleep without the sling?","What limits should I follow at work/school?","When can I resume sports or lifting?"]
-    return base[:3]  # keep suggestions to 3 to match single-line UI
+    return base[:3]
 
 # ========= FASTAPI =========
 app = FastAPI(title="Patient Education")
@@ -315,16 +403,12 @@ class AskBody(BaseModel):
     session_id: Optional[str] = None
     selected_type: Optional[str] = None
 
-# ---- Mount folder for logo ------
-# repo root (one level up from app/)
-from fastapi.staticfiles import StaticFiles
+# ---- Static mount ----
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT / "static"
-
 app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="static")
 
-
-# ---- Health endpoints for Railway health checks ----
+# ---- Health ----
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     ok = bool(collection)
@@ -347,7 +431,7 @@ def debug_static():
     except Exception as e:
         listing = f"(error listing: {e})"
     return f"STATIC_DIR={p}\nexists={p.exists()}\nfiles:\n{listing}"
-    
+
 # ========= UI helpers =========
 @app.get("/types")
 def get_types():
@@ -356,7 +440,7 @@ def get_types():
 @app.get("/pills")
 def get_pills(type: str = Query(...)):
     pills = PROCEDURE_PILLS.get(type, PROCEDURE_PILLS["General (All Types)"])
-    return {"pills": pills[:3]}  # limit to 3 so they fit one row
+    return {"pills": pills[:3]}  # exactly 3, fixed grid
 
 # ========= Ingest =========
 @app.post("/ingest")
@@ -416,81 +500,127 @@ def read_session(sid: str):
 # ========= Ask =========
 @app.post("/ask")
 def ask(body: AskBody):
-    q = (body.question or "").strip()
-    if not q:
+    q_raw = (body.question or "").strip()
+    if not q_raw:
         return {"answer": "Please enter a question.", "pills": [], "unverified": False}
 
-    safety = triage_flags(q)
+    safety = triage_flags(q_raw)
     if safety.get("blocked"):
         return {"answer": "I can’t help with that request.", "pills": [], "unverified": False}
 
     sid = body.session_id or uuid.uuid4().hex[:10]
     if sid not in SESSIONS:
         SESSIONS[sid] = {"title": "New chat", "messages": []}
-    SESSIONS[sid]["messages"].append({"role": "user", "content": q})
+    SESSIONS[sid]["messages"].append({"role": "user", "content": q_raw})
     if not SESSIONS[sid].get("title") or SESSIONS[sid]["title"] == "New chat":
-        SESSIONS[sid]["title"] = q[:60]
+        SESSIONS[sid]["title"] = q_raw[:60]
 
     selected_type = body.selected_type or "General (All Types)"
     SESSIONS[sid]["selected_type"] = selected_type
 
-    docs = _retrieve(q, n=10, topic="shoulder", selected_type=selected_type)
-    if (not docs) or all((not (d or "").strip()) for d in docs):
-        q2 = _paraphrase_once(q)
-        if q2 and q2 != q:
-            docs = _retrieve(q2, n=10, topic="shoulder", selected_type=selected_type)
+    # Build rich, expanded queries
+    queries = expand_query_variants(q_raw)
+    pairs = _retrieve_rich(queries, n=12, topic="shoulder", selected_type=selected_type)
 
-    if (not docs) or len([d for d in docs if d and d.strip()]) < 3:
-        try:
-            global_docs = _retrieve(q, n=12, topic="shoulder", selected_type=None)
-            if global_docs:
-                scored = [(d, _keyword_hits(d, selected_type)) for d in global_docs if isinstance(d, str) and d.strip()]
-                scored.sort(key=lambda x: x[1], reverse=True)
-                seen, merged = set(), []
-                for d in (docs + [x[0] for x in scored]):
-                    if d and d not in seen:
-                        seen.add(d); merged.append(d)
-                docs = merged[:10]
-        except Exception:
-            pass
+    # If still weak, widen to any shoulder type
+    if len(pairs) < 3:
+        widen = _retrieve_rich(queries, n=12, topic="shoulder", selected_type=None)
+        # union while preserving order
+        seen = {p[2] for p in pairs}
+        for it in widen:
+            if it[2] not in seen:
+                pairs.append(it); seen.add(it[2])
 
-    context = _build_context(docs, max_chars=1800)
-    answer_text = _summarize_from_context(q, context)
+    context, used_sources = _build_context_and_sources(pairs, max_chars=2400)
 
-    parts_in_q = _mentioned_parts(q)
+    # Coverage check
+    if not context_covers_question(q_raw, context):
+        # FINAL backstop: external short fallback (clearly marked)
+        external_answer = ""
+        if client:
+            try:
+                r = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    temperature=0.2,
+                    messages=[
+                        {"role":"system","content":"Give a brief, general orthopedic explanation (3–5 sentences). Do not mention you are using external info. Be accurate and neutral."},
+                        {"role":"user","content":q_raw}
+                    ],
+                )
+                external_answer = (r.choices[0].message.content or "").strip()
+            except Exception:
+                external_answer = ""
+        ans = external_answer or NO_MATCH_MESSAGE
+        if ans != NO_MATCH_MESSAGE:
+            ans += '<div style="color:#6b7280;font-size:12px;margin-top:6px;">— External reference (not clinic-verified)</div>'
+        SESSIONS[sid]["messages"].append({"role":"assistant","content":ans})
+        return {"answer": ans, "pills": adaptive_followups(q_raw, ans, selected_type), "unverified": True, "session_id": sid}
+
+    answer_text = _summarize_from_context(q_raw, context)
+
+    # body part sanity
+    parts_in_q = _mentioned_parts(q_raw)
     if parts_in_q and ("shoulder" not in parts_in_q):
         ctx_low = context.lower()
         if not any(any(tok in ctx_low for tok in _BODY_PARTS[p]) for p in parts_in_q):
             answer_text = NO_MATCH_MESSAGE
 
+    # block generic diet/constipation advice unless those terms are in context
+    if forbidden_if_not_in_context(answer_text, context):
+        answer_text = NO_MATCH_MESSAGE
+
+    # If still no doc-grounded answer, try one more paraphrase; then external with mark
     if answer_text.strip() == NO_MATCH_MESSAGE.strip():
-        q2 = _paraphrase_once(q)
-        if q2 and q2 != q:
-            docs2 = _retrieve(q2, n=10, topic="shoulder", selected_type=selected_type)
-            ctx2 = _build_context(docs2, max_chars=1800) if docs2 else ""
-            if ctx2:
-                answer2 = _summarize_from_context(q2, ctx2)
-                if answer2.strip():
-                    answer_text = answer2
+        queries2 = expand_query_variants(q_raw)
+        pairs2 = _retrieve_rich(queries2, n=12, topic="shoulder", selected_type=selected_type)
+        context2, used_sources2 = _build_context_and_sources(pairs2, max_chars=2400)
+        if context2 and context_covers_question(q_raw, context2):
+            tmp = _summarize_from_context(q_raw, context2)
+            if tmp.strip() and not forbidden_if_not_in_context(tmp, context2):
+                answer_text = tmp
+                used_sources = used_sources2
 
     verified = (answer_text.strip() != NO_MATCH_MESSAGE.strip())
 
+    if verified:
+        # Append in-app citation of clinic sources
+        if used_sources:
+            src_line = "— Source: Clinic materials [" + ", ".join(used_sources[:3]) + "]"
+            answer_text += f'<div style="color:#6b7280;font-size:12px;margin-top:6px;">{src_line}</div>'
+    else:
+        # external fallback
+        external_answer = ""
+        if client:
+            try:
+                r = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    temperature=0.2,
+                    messages=[
+                        {"role":"system","content":"Give a brief, general orthopedic explanation (3–5 sentences)."},
+                        {"role":"user","content":q_raw}
+                    ],
+                )
+                external_answer = (r.choices[0].message.content or "").strip()
+            except Exception:
+                external_answer = ""
+        answer_text = external_answer or NO_MATCH_MESSAGE
+        if answer_text != NO_MATCH_MESSAGE:
+            answer_text += '<div style="color:#6b7280;font-size:12px;margin-top:6px;">— External reference (not clinic-verified)</div>'
+
     try:
-        sugs = gen_suggestions(q, answer_text, topic="shoulder", k=3, avoid=[])
+        sugs = gen_suggestions(q_raw, answer_text, topic="shoulder", k=3, avoid=[])
         if not sugs:
             raise ValueError("empty sugg")
         pills = [s if s.endswith("?") else s + "?" for s in sugs][:3]
     except Exception:
-        pills = adaptive_followups(q, answer_text, selected_type)
+        pills = adaptive_followups(q_raw, answer_text, selected_type)
 
     SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
     return {"answer": answer_text, "pills": pills[:3], "unverified": (not verified), "session_id": sid}
 
-
 # ========= UI =========
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Plain triple-quoted string (NOT f-string) to avoid brace escaping issues.
     return HTMLResponse("""
 <!doctype html>
 <html lang="en">
@@ -566,16 +696,16 @@ def home():
   .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
   .chat-area { flex:1; overflow:auto; padding:18px 24px; }
 
-  /* Pills: single row with horizontal scroll */
+  /* Pills: ALWAYS uniform, never off-screen (3-column grid) */
   .pills {
-    display:block; white-space:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch;
-    padding:0 24px 12px;
+    display:grid; grid-template-columns: repeat(3, minmax(0,1fr));
+    gap:12px; padding:0 24px 12px;
   }
   .pill {
-    display:inline-block;
-    border:1px solid var(--pill-border); background:#fff; padding:12px 16px; border-radius:999px;
-    font-size:16px; cursor:pointer; line-height:1; box-shadow: 0 1px 0 rgba(0,0,0,0.02);
-    margin-right:12px;
+    display:inline-flex; align-items:center; justify-content:center;
+    border:1px solid var(--pill-border); background:#fff; padding:12px 14px; border-radius:999px;
+    font-size:15px; cursor:pointer; line-height:1.2; min-height:44px; text-align:center;
+    white-space:normal; word-break:break-word;
   }
 
   .bubble { max-width:820px; padding:12px 14px; border:1px solid var(--border); border-radius:14px; margin:8px 0; line-height:1.45; }
@@ -739,7 +869,7 @@ async function listSessions() {
 async function newChat(silent=false) {
   const data = await fetch('/sessions/new', {method:'POST'}).then(r=>r.json());
   SESSION_ID = data.session_id;
-  if (!silent) { /* behave like ChatGPT: go to home on New chat */ goHome(); }
+  if (!silent) { goHome(); }
   await listSessions();
 }
 
@@ -747,7 +877,6 @@ async function loadSession(id) {
   const data = await fetch('/sessions/'+id).then(r=>r.json());
   SESSION_ID = id;
   const chat = document.getElementById('chat'); chat.innerHTML='';
-  // If you open a previous chat, show chat view
   document.getElementById('hero').style.display = 'none';
   document.getElementById('topbar').style.display = 'flex';
   document.getElementById('chatContent').style.display = 'flex';
