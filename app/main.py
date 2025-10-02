@@ -447,9 +447,10 @@ def home():
     --sidebar-w: 15rem;
   }
   * { box-sizing:border-box; }
+  html, body { height:100%; }
   body { margin:0; background:var(--bg); color:var(--text);
     font-family: "SF Pro Text","SF Pro Display",-apple-system,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
-  .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }
+  .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; overflow:hidden; }
 
   /* Sidebar */
   .sidebar { border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }
@@ -462,7 +463,7 @@ def home():
 
   /* Main column */
   .main { display:flex; flex-direction:column; min-width:0; }
-  .hero { flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }
+  .hero { flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; overflow:auto; }
   .hero-inner { text-align:center; max-width:820px; }
   .hero .badge { display:inline-block; padding:6px 12px; border-radius:999px; background:var(--orange-soft); color:#9a4b00; font-weight:700; font-size:12px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:14px; }
   .hero h1 { font-size: clamp(36px, 4.6vw, 52px); line-height:1.08; margin:0 0 14px; font-weight:800; letter-spacing:-0.02em; color:#000; }
@@ -478,10 +479,9 @@ def home():
   .topic-panel select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }
 
   /* Chat + fixed bottom composer (like ChatGPT) */
-  .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+  .content { flex:1; display:flex; flex-direction:column; min-height:0; }
   .chat-area { flex:1; overflow:auto; }
-  .chat-inner { max-width: 820px; margin: 0 auto; padding: 18px 24px 180px; display:flex; flex-direction:column; gap:8px; }
-  /* ^ padding-bottom makes room for the fixed composer */
+  .chat-inner { max-width: 820px; margin: 0 auto; padding: 18px 24px 24px; display:flex; flex-direction:column; gap:8px; }
 
   .message { display:flex; width:100%; }
   .message.bot { justify-content:flex-start; }
@@ -490,12 +490,14 @@ def home():
   .bot .bubble { background:#fafafa; }
   .user .bubble { background:#fff; border-color:#ddd; }
 
+  /* === Fixed bottom composer === */
   .composer-wrap {
     position: fixed;
     bottom: 0;
-    left: var(--sidebar-w);   /* sit to the right of the sidebar */
+    /* left is set dynamically via JS to match actual sidebar width */
+    left: 0;
     right: 0;
-    z-index: 20;
+    z-index: 1000;
     background: linear-gradient(to top, rgba(255,255,255,0.98), rgba(255,255,255,0.94) 60%, transparent);
     border-top:1px solid var(--border);
     padding: 10px 16px 16px;
@@ -503,9 +505,9 @@ def home():
   }
   .composer-inner { max-width:820px; margin:0 auto; }
 
-  /* Pills row INSIDE bottom composer */
-  .pills { width:100%; display:grid; grid-template-columns: repeat(2, minmax(120px, 1fr)); gap:10px; margin:0 0 10px; }
-  .pill { display:block; border:1px solid var(--pill-border); background:#fff; padding:12px 16px; border-radius:999px; font-size:16px; cursor:pointer; text-align:center; white-space:normal; }
+  /* Pills: single-row, scrollable (ChatGPT-like) */
+  .pills { width:100%; display:flex; gap:10px; margin:0 0 10px; overflow-x:auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+  .pill { flex:0 0 auto; border:1px solid var(--pill-border); background:#fff; padding:10px 14px; border-radius:999px; font-size:14px; cursor:pointer; white-space:nowrap; }
 
   .composer {
     display:flex; align-items:center; gap:10px;
@@ -518,10 +520,8 @@ def home():
   .spinner { width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color:#ff7a18; animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px; }
   @keyframes spin { to { transform:rotate(360deg); } }
 
-  @media (max-width: 520px) {
+  @media (max-width: 720px) {
     .bubble { max-width: 100%; }
-    .pills { grid-template-columns: 1fr; }
-    .composer-wrap { left: var(--sidebar-w); } /* sidebar remains; composer still aligns to chat column */
   }
 </style>
 </head>
@@ -566,7 +566,7 @@ def home():
       <div class="chat-area"><div class="chat-inner" id="chat"></div></div>
 
       <!-- Fixed bottom like ChatGPT: pills + input -->
-      <div class="composer-wrap">
+      <div class="composer-wrap" id="composerWrap">
         <div class="composer-inner">
           <div class="pills" id="pills"></div>
           <div class="composer">
@@ -600,6 +600,7 @@ function goHome() {
   document.getElementById('pills').innerHTML = '';
   const selHero = document.getElementById('typeHero');
   if (selHero && selHero.options.length) selHero.value = "General (All Types)";
+  padForComposer(); // ensure padding reset
 }
 
 async function boot() {
@@ -617,7 +618,13 @@ async function boot() {
   selTop.addEventListener('change', () => handleTypeChange(selTop.value, false));
 
   await listSessions();
-  // No pre-creation of sessions; made on first message
+
+  // lock composer to bottom & align with sidebar width
+  positionComposer();
+  padForComposer();
+  window.addEventListener('resize', () => { positionComposer(); padForComposer(); });
+  // guard: in case fonts/UI load late and sizes change
+  setTimeout(()=>{ positionComposer(); padForComposer(); }, 150);
 }
 
 function handleTypeChange(value, fromHero) {
@@ -634,6 +641,7 @@ function handleTypeChange(value, fromHero) {
   document.getElementById('chat').innerHTML = '';
   renderTypePills();
   addBot('Filtering to “' + SELECTED_TYPE + '”. Ask a question or tap a quick question.');
+  padForComposer();
 }
 
 function renderTypePills() {
@@ -647,6 +655,7 @@ function renderTypePills() {
         b.onclick = () => { document.getElementById('q').value = label; ask(); };
         el.appendChild(b);
       });
+      padForComposer();
     });
 }
 
@@ -663,7 +672,6 @@ async function listSessions() {
 }
 
 function newChat() {
-  // Reset UI only; no empty session created
   SESSION_ID = null;
   goHome();
   listSessions();
@@ -678,6 +686,7 @@ async function loadSession(id) {
   document.getElementById('chatContent').style.display = 'block';
   data.messages.forEach(m => { if(m.role==='user') addUser(m.content); else addBot(m.content); });
   renderTypePills();
+  padForComposer();
 }
 
 function addUser(text) {
@@ -706,6 +715,23 @@ function spinner() {
 function scrollBottom() {
   const area = document.querySelector('.chat-area');
   area.scrollTop = area.scrollHeight;
+}
+
+/* === Keep composer locked & chat padded === */
+function positionComposer() {
+  const sidebar = document.querySelector('.sidebar');
+  const wrap = document.getElementById('composerWrap');
+  if (!sidebar || !wrap) return;
+  const rect = sidebar.getBoundingClientRect();
+  wrap.style.left = rect.width + 'px';
+}
+function padForComposer() {
+  const wrap = document.getElementById('composerWrap');
+  const inner = document.querySelector('.chat-inner');
+  if (!wrap || !inner) return;
+  // Add bottom padding equal to composer height + a little breathing room
+  const h = wrap.offsetHeight || 0;
+  inner.style.paddingBottom = (h + 24) + 'px';
 }
 
 async function ask() {
@@ -737,6 +763,7 @@ async function ask() {
     addBot('<div style="color:#6b7280;font-size:12px;margin-top:6px;">This information is not verified by the clinic; please contact your provider with questions.</div>');
   }
 
+  padForComposer();
   await listSessions();
 }
 
