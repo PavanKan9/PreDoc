@@ -347,7 +347,7 @@ def sessions():
 
 @app.post("/sessions/new")
 def new_session():
-    # Create an empty shell; will be hidden unless a message arrives
+    # Just returns an id; we still won’t show it until there are messages
     sid = uuid.uuid4().hex[:10]
     SESSIONS[sid] = {"title": "New chat", "messages": [], "selected_type": None}
     return {"session_id": sid}
@@ -460,7 +460,7 @@ def home():
   .skeleton { height:10px; background:#f1f1f1; border-radius:8px; margin:10px 0; width:80%; }
   .skeleton:nth-child(2) { width:70%; } .skeleton:nth-child(3) { width:60%; }
 
-  /* Main */
+  /* Main column */
   .main { display:flex; flex-direction:column; min-width:0; }
   .hero { flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }
   .hero-inner { text-align:center; max-width:820px; }
@@ -471,17 +471,17 @@ def home():
   .hero label { color:#111; font-weight:600; }
   .hero select { min-width:280px; border:2px solid var(--orange); border-radius:12px; padding:10px 12px; background:#fff; color:inherit; }
 
-  /* Topbar */
   .topbar { display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }
   .title { font-size:22px; font-weight:700; letter-spacing:.2px; }
   .topic-chip { position:absolute; right:18px; top:12px; background:var(--chip); border:1px solid var(--chip-border); color:#333; padding:8px 14px; border-radius:999px; font-size:13px; display:flex; align-items:center; gap:8px; cursor:pointer; }
   .topic-panel { position:absolute; right:18px; top:52px; background:#fff; border:1px solid var(--border); border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:10px; display:none; z-index:10; }
   .topic-panel select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }
 
-  /* Chat + sticky composer at bottom (ChatGPT-like) */
+  /* Chat + fixed bottom composer (like ChatGPT) */
   .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
   .chat-area { flex:1; overflow:auto; }
-  .chat-inner { max-width: 820px; margin: 0 auto; padding: 18px 24px 96px; display:flex; flex-direction:column; gap:8px; }
+  .chat-inner { max-width: 820px; margin: 0 auto; padding: 18px 24px 180px; display:flex; flex-direction:column; gap:8px; }
+  /* ^ padding-bottom makes room for the fixed composer */
 
   .message { display:flex; width:100%; }
   .message.bot { justify-content:flex-start; }
@@ -491,14 +491,19 @@ def home():
   .user .bubble { background:#fff; border-color:#ddd; }
 
   .composer-wrap {
-    position: sticky; bottom: 0; left: 0; right: 0;
-    background: linear-gradient(to top, rgba(255,255,255,0.98), rgba(255,255,255,0.92) 60%, transparent);
+    position: fixed;
+    bottom: 0;
+    left: var(--sidebar-w);   /* sit to the right of the sidebar */
+    right: 0;
+    z-index: 20;
+    background: linear-gradient(to top, rgba(255,255,255,0.98), rgba(255,255,255,0.94) 60%, transparent);
     border-top:1px solid var(--border);
     padding: 10px 16px 16px;
+    backdrop-filter: saturate(1.1) blur(6px);
   }
   .composer-inner { max-width:820px; margin:0 auto; }
 
-  /* Pills row INSIDE composer (never off-screen) */
+  /* Pills row INSIDE bottom composer */
   .pills { width:100%; display:grid; grid-template-columns: repeat(2, minmax(120px, 1fr)); gap:10px; margin:0 0 10px; }
   .pill { display:block; border:1px solid var(--pill-border); background:#fff; padding:12px 16px; border-radius:999px; font-size:16px; cursor:pointer; text-align:center; white-space:normal; }
 
@@ -513,9 +518,10 @@ def home():
   .spinner { width:18px; height:18px; border-radius:50%; border:3px solid #e6e6e6; border-top-color:#ff7a18; animation:spin 1s linear infinite; display:inline-block; vertical-align:middle; margin-left:6px; }
   @keyframes spin { to { transform:rotate(360deg); } }
 
-  @media (max-width:520px) {
-    .bubble { max-width:100%; }
+  @media (max-width: 520px) {
+    .bubble { max-width: 100%; }
     .pills { grid-template-columns: 1fr; }
+    .composer-wrap { left: var(--sidebar-w); } /* sidebar remains; composer still aligns to chat column */
   }
 </style>
 </head>
@@ -559,7 +565,7 @@ def home():
     <div class="content" id="chatContent" style="display:none;">
       <div class="chat-area"><div class="chat-inner" id="chat"></div></div>
 
-      <!-- Sticky bottom like ChatGPT: pills + input -->
+      <!-- Fixed bottom like ChatGPT: pills + input -->
       <div class="composer-wrap">
         <div class="composer-inner">
           <div class="pills" id="pills"></div>
@@ -611,7 +617,7 @@ async function boot() {
   selTop.addEventListener('change', () => handleTypeChange(selTop.value, false));
 
   await listSessions();
-  // Do NOT pre-create a session; we only create on first message
+  // No pre-creation of sessions; made on first message
 }
 
 function handleTypeChange(value, fromHero) {
@@ -657,7 +663,7 @@ async function listSessions() {
 }
 
 function newChat() {
-  // Just reset UI (ChatGPT behavior). Do not create a session yet.
+  // Reset UI only; no empty session created
   SESSION_ID = null;
   goHome();
   listSessions();
@@ -718,7 +724,7 @@ async function ask() {
 
   spinRow.remove();
   addBot(data.answer);
-  if (!SESSION_ID && data.session_id) SESSION_ID = data.session_id; // create on first ask
+  if (!SESSION_ID && data.session_id) SESSION_ID = data.session_id; // created on first ask
 
   const el = document.getElementById('pills'); el.innerHTML='';
   (data.pills || []).slice(0,2).forEach(label => {
