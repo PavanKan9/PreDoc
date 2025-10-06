@@ -619,6 +619,38 @@ def ask(body: AskBody):
     SESSIONS[sid]["messages"].append({"role": "assistant", "content": answer_text})
     return {"answer": answer_text, "pills": pills[:3], "unverified": (not verified), "session_id": sid}
 
+# ========= RED-FLAG DETECTION =========
+RED_FLAG_MESSAGE = (
+    "This may be a post-operative red flag. "
+    "<strong>Please contact the clinic directly:</strong> "
+    "SF office — (415) 353-6400 &nbsp;•&nbsp; Marin office — (415) 886-8538. "
+    "If you feel unsafe, call emergency services."
+)
+
+# common red-flag patterns
+_re_temp = re.compile(r"\b(temp|fever)\b.*?(100\.4|101|102|103)", re.I)
+_re_redness = re.compile(r"\b(red|warm|inflamed|hot)\b.*\b(worse|spreading|tracking|increasing)\b", re.I)
+_re_streaks = re.compile(r"red(\s+)?streak", re.I)
+_re_drain = re.compile(r"\b(drain|ooze|discharge|fluid|liquid|leak|weeping|gunk)\b", re.I)
+_re_foul = re.compile(r"\b(bad|foul|weird|strong|unusual)\s*(smell|odor)\b", re.I)
+_re_pus = re.compile(r"\b(pus|purulent|yellow|green|thick)\s*(fluid|drain|discharge)?\b", re.I)
+_re_open = re.compile(r"(open|split|gaping|separate|dehis)\w*\s*(incision|wound|site)?", re.I)
+_re_pain = re.compile(r"\b(worse|increasing|more)\s+(pain|sore|ache)\b", re.I)
+
+def detect_red_flags(text: str) -> bool:
+    """Return True if the user message likely describes a red-flag symptom."""
+    if not text:
+        return False
+    t = text.lower()
+    wound_ref = any(w in t for w in ["incision", "wound", "cut", "site", "scar", "surgery", "operation"])
+    has_symptom = any([
+        _re_temp.search(t), _re_redness.search(t), _re_streaks.search(t),
+        _re_drain.search(t), _re_foul.search(t), _re_pus.search(t),
+        _re_open.search(t), _re_pain.search(t)
+    ])
+    return bool((has_symptom and wound_ref) or _re_temp.search(t))
+
+
 # ========= UI =========
 @app.get("/", response_class=HTMLResponse)
 def home():
