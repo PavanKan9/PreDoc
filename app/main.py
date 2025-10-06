@@ -627,28 +627,49 @@ RED_FLAG_MESSAGE = (
     "If you feel unsafe, call emergency services."
 )
 
-# common red-flag patterns
+# core patterns
 _re_temp = re.compile(r"\b(temp|fever)\b.*?(100\.4|101|102|103)", re.I)
-_re_redness = re.compile(r"\b(red|warm|inflamed|hot)\b.*\b(worse|spreading|tracking|increasing)\b", re.I)
+_re_redness = re.compile(r"\b(red|warm|inflamed|hot)\b.*\b(worse|worsen\w*|spreading|tracking|increasing)\b", re.I)
 _re_streaks = re.compile(r"red(\s+)?streak", re.I)
 _re_drain = re.compile(r"\b(drain|ooze|discharge|fluid|liquid|leak|weeping|gunk)\b", re.I)
-_re_foul = re.compile(r"\b(bad|foul|weird|strong|unusual)\s*(smell|odor)\b", re.I)
-_re_pus = re.compile(r"\b(pus|purulent|yellow|green|thick)\s*(fluid|drain|discharge)?\b", re.I)
-_re_open = re.compile(r"(open|split|gaping|separate|dehis)\w*\s*(incision|wound|site)?", re.I)
-_re_pain = re.compile(r"\b(worse|increasing|more)\s+(pain|sore|ache)\b", re.I)
+_re_foul  = re.compile(r"\b(bad|foul|weird|strong|unusual)\s*(smell|odor)\b", re.I)
+_re_pus   = re.compile(r"\b(pus|purulent|yellow|green|thick)\s*(fluid|drain|discharge)?\b", re.I)
+_re_open  = re.compile(r"(open|split|gaping|separate|dehis)\w*\s*(incision|wound|site)?", re.I)
+
+# pain/burning — allow without incision words so “my shoulder burns” and
+# “my pain is getting worse” trigger even if no wound mentioned.
+_re_pain_worse_fwd = re.compile(r"\b(pain|soreness|ache)\b.*\b(getting\s+worse|worse|worsen\w*|increasing|more)\b", re.I)
+_re_pain_worse_rev = re.compile(r"\b(getting\s+worse|worse|worsen\w*|increasing|more)\b.*\b(pain|soreness|ache)\b", re.I)
+_re_burning        = re.compile(r"\b(burn|burning|burns|burning\s+pain)\b", re.I)
 
 def detect_red_flags(text: str) -> bool:
-    """Return True if the user message likely describes a red-flag symptom."""
+    """
+    Returns True if the message likely describes a post-op red flag.
+    Conservative choice: any fever OR any worsening pain/burning OR
+    wound-related concerning symptoms will trigger.
+    """
     if not text:
         return False
     t = text.lower()
-    wound_ref = any(w in t for w in ["incision", "wound", "cut", "site", "scar", "surgery", "operation"])
-    has_symptom = any([
-        _re_temp.search(t), _re_redness.search(t), _re_streaks.search(t),
-        _re_drain.search(t), _re_foul.search(t), _re_pus.search(t),
-        _re_open.search(t), _re_pain.search(t)
-    ])
-    return bool((has_symptom and wound_ref) or _re_temp.search(t))
+
+    # 1) Always trigger on fever or worsening pain/burning — no wound word required
+    if _re_temp.search(t) or _re_burning.search(t) or _re_pain_worse_fwd.search(t) or _re_pain_worse_rev.search(t):
+        return True
+
+    # 2) For drainage/odor/redness/opening, require some wound/incision context
+    wound_ctx = any(w in t for w in ["incision", "wound", "cut", "site", "scar", "surgery", "operation", "shoulder"])
+    if wound_ctx and any([
+        _re_redness.search(t),
+        _re_streaks.search(t),
+        _re_drain.search(t),
+        _re_foul.search(t),
+        _re_pus.search(t),
+        _re_open.search(t),
+    ]):
+        return True
+
+    return False
+
 
 
 # ========= UI =========
