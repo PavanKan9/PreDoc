@@ -1,3 +1,6 @@
+Here’s a drop-in replacement for your `main.py` with an explicit red-flag detector that triggers the exact message you specified whenever a user’s question mentions those issues (including common synonyms and numeric fever checks in °F or °C).
+
+```python
 # main.py
 from fastapi import FastAPI, UploadFile, File, Query
 from pathlib import Path
@@ -391,6 +394,105 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
         return ["When do I start passive vs active motion?","When can I sleep without the sling?","What limits should I follow at work/school?","When can I resume sports or lifting?"]
     return base[:3]
 
+# ========= RED FLAG DETECTION =========
+RED_FLAG_MESSAGE = (
+    "This may be a red flag. Please contact the clinic directly: "
+    "SF (415) 353-6400 / Marin (415) 886-8538"
+)
+
+# Precompile helpful regexes
+RE_DEG = re.compile(r"[°\s]*([fFcC])?")
+RE_NUMBER = re.compile(r"(\d{2,3}(?:\.\d+)?)")
+RE_FEVER_LINE = re.compile(
+    r"\b(?:temp(?:erature)?|fever)\b[^0-9a-zA-Z]{0,10}"
+    r"(?:is|at|of|=|>|greater than|over|above)?[^0-9a-zA-Z]{0,10}"
+    r"(\d{2,3}(?:\.\d+)?)\s*([°\s]*[fFcC])?",
+    re.IGNORECASE
+)
+
+def _c_to_f(c: float) -> float:
+    return (c * 9.0/5.0) + 32.0
+
+def _fever_over_threshold(text: str, threshold_f: float = 100.4) -> bool:
+    for m in RE_FEVER_LINE.finditer(text):
+        val = float(m.group(1))
+        unit = m.group(2).strip().lower() if m.group(2) else ""
+        if "c" in unit:
+            val_f = _c_to_f(val)
+        else:
+            val_f = val
+        if val_f >= threshold_f:
+            return True
+    # Catch phrases like "high fever", "spiking fever" (without number)
+    if re.search(r"\b(high|spiking|worsening)\s+fever\b", text, re.IGNORECASE):
+        return True
+    return False
+
+def _time_days_mentioned(text: str) -> Optional[int]:
+    m = re.search(r"\b(?:day|days)\s*(\d{1,2})\b", text, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    # also "for X days"
+    m2 = re.search(r"\bfor\s*(\d{1,2})\s*days\b", text, re.IGNORECASE)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except Exception:
+            return None
+    return None
+
+def is_red_flag(user_text: str) -> bool:
+    t = (user_text or "").lower().strip()
+
+    # 1) Fever / elevated temperature >= 100.4 F (handles C or F, numeric or phrases)
+    if _fever_over_threshold(t):
+        return True
+
+    # 2) New onset / worsening redness
+    if re.search(r"\b(new(?:\s+onset)?|worsening|increasing)\s+red(?:ness)?\b", t, re.IGNORECASE):
+        return True
+
+    # 3) Redness leading/spreading/streaking from wound/incision
+    if re.search(r"\b(red(?:ness)?\s+(?:leading|tracking|spreading|streaking)\s+(?:from|away\s+from)\s+(?:the\s+)?(wound|incision|site))\b", t, re.IGNORECASE):
+        return True
+    if re.search(r"\bred\s+streaks?\b", t, re.IGNORECASE):
+        return True
+
+    # 4) Drainage beyond 4 days
+    if re.search(r"\b(drainage|discharge|leakage|leaking|fluid|ooze|oozing|seep(?:age)?)\b", t, re.IGNORECASE):
+        days = _time_days_mentioned(t)
+        if days is not None and days >= 5:
+            return True
+        if re.search(r"\b(beyond|after|past|more than)\s*(?:four|4)\s*days\b", t, re.IGNORECASE):
+            return True
+
+    # 5) Foul-smelling drainage or pus at any time
+    if re.search(r"\b(foul|bad|smelly|malodor(?:ous)?)\b.*\b(drainage|discharge|odor|smell)\b", t, re.IGNORECASE):
+        return True
+    if re.search(r"\b(pus|purulent)\b", t, re.IGNORECASE):
+        return True
+
+    # 6) Opening of the incision (dehiscence, gaping, split)
+    if re.search(r"\b(open(?:ing)?|opened|split|splitting|gaping|came\s+open|dehisc(?:e|ed|ence))\b.*\b(incision|wound|stitches|portal)\b", t, re.IGNORECASE):
+        return True
+
+    # 7) Worsening pain
+    if re.search(r"\b(pain\s+is\s+getting\s+worse|worsening\s+pain|pain\s+got\s+worse|increasing\s+pain|pain\s+is\s+worse)\b", t, re.IGNORECASE):
+        return True
+
+    # Additional phrasing for examples like "fluid leakage", "fever 101"
+    if re.search(r"\bfluid\s+leak(age|ing)?\b", t, re.IGNORECASE):
+        days = _time_days_mentioned(t)
+        if days is None or days >= 5:
+            return True
+    if re.search(r"\bfever\b.*\b101\b", t, re.IGNORECASE):
+        return True
+
+    return False
+
 # ========= FASTAPI =========
 app = FastAPI(title="Patient Education")
 app.add_middleware(
@@ -478,6 +580,20 @@ async def ingest(file: UploadFile = File(...)):
 
     return {"ok": True, "chunks": len(docs), "file": file.filename, "chroma_mode": CHROMA_MODE}
 
+# ---- Simple heuristic chunk classifier used during ingest ----
+def classify_chunk(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in ["rotator cuff","supraspinatus","infraspinatus","subscapularis"]): return "Rotator Cuff Repair"
+    if "slap" in t or "biceps anchor" in t: return "SLAP Repair"
+    if "bankart" in t and "posterior" not in t: return "Bankart (Anterior Labrum) Repair"
+    if "posterior labrum" in t or ("posterior" in t and "labrum" in t): return "Posterior Labrum Repair"
+    if "tenodesis" in t or "tenotomy" in t or "biceps tendon" in t: return "Biceps Tenodesis/Tenotomy"
+    if "subacromial" in t or "acromioplasty" in t: return "Subacromial Decompression (SAD)"
+    if "distal clavicle" in t or "mumford" in t: return "Distal Clavicle Excision"
+    if "capsular release" in t or "adhesive capsulitis" in t: return "Capsular Release"
+    if "debridement" in t or "synovectomy" in t: return "Debridement/Diagnostic Only"
+    return "General (All Types)"
+
 # ========= Sessions =========
 @app.get("/sessions")
 def sessions():
@@ -507,12 +623,29 @@ def read_session(sid: str):
     return {"messages": sess["messages"]}
 
 # ========= Ask =========
+class AskBody(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+    selected_type: Optional[str] = None
+
 @app.post("/ask")
 def ask(body: AskBody):
     q_raw = (body.question or "").strip()
     if not q_raw:
         return {"answer": "Please enter a question.", "pills": [], "unverified": False}
 
+    # RED-FLAG CHECK (runs before general safety so it always reaches the user)
+    if is_red_flag(q_raw):
+        sid = body.session_id or uuid.uuid4().hex[:10]
+        if sid not in SESSIONS:
+            SESSIONS[sid] = {"title": "", "messages": []}
+        SESSIONS[sid]["messages"].append({"role": "user", "content": q_raw})
+        if not SESSIONS[sid].get("title"):
+            SESSIONS[sid]["title"] = q_raw[:60]
+        SESSIONS[sid]["messages"].append({"role": "assistant", "content": RED_FLAG_MESSAGE})
+        return {"answer": RED_FLAG_MESSAGE, "pills": [], "unverified": False, "session_id": sid}
+
+    # General safety (non-medical policy etc.)
     safety = triage_flags(q_raw)
     if safety.get("blocked"):
         return {"answer": "I can’t help with that request.", "pills": [], "unverified": False}
@@ -634,7 +767,7 @@ def home():
     --bg:#fff; --text:#0b0b0c; --muted:#6b7280; --border:#eaeaea;
     --chip:#f6f6f6; --chip-border:#d9d9d9; --pill-border:#dbdbdb;
     --accent:#0a84ff; --orange:#ff7a18; --orange-soft:#ffe8d6;
-    --sidebar-w: 15rem; --sidebar-bg:#f7f7f8; /* ChatGPT-like grey */
+    --sidebar-w: 15rem; --sidebar-bg:#f7f7f8;
   }
   * { box-sizing:border-box; }
   body {
@@ -645,7 +778,6 @@ def home():
   }
   .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }
 
-  /* Sidebar */
   .sidebar {
     background: var(--sidebar-bg);
     border-right:1px solid var(--border);
@@ -658,10 +790,8 @@ def home():
   .skeleton { height:10px; background:#efefef; border-radius:8px; margin:10px 0; width:80%; }
   .skeleton:nth-child(2) { width:70%; } .skeleton:nth-child(3) { width:60%; }
 
-  /* Main */
   .main { display:flex; flex-direction:column; min-width:0; }
 
-  /* HERO (Welcome) */
   .hero { flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }
   .hero-inner { text-align:center; max-width:820px; }
   .hero .badge { display:inline-block; padding:6px 12px; border-radius:999px; background:var(--orange-soft); color:#9a4b00; font-weight:700; font-size:12px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:14px; }
@@ -671,7 +801,6 @@ def home():
   .hero label { color:#111; font-weight:600; }
   .hero select { min-width:280px; border:2px solid var(--orange); border-radius:12px; padding:10px 12px; background:#fff; color:inherit; }
 
-  /* TOPBAR (chat view) */
   .topbar { display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }
   .title { font-size:22px; font-weight:700; letter-spacing:.2px; }
   .topic-chip { position:absolute; right:18px; top:12px; background:#fff; border:1px solid var(--chip-border); color:#333; padding:8px 14px; border-radius:999px; font-size:13px; display:flex; align-items:center; gap:8px; cursor:pointer; }
@@ -680,20 +809,16 @@ def home():
 
   .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
 
-  /* Chat column like ChatGPT: centered, single column */
   .chat-wrap { flex:1; overflow:auto; }
   .chat-col { max-width: 780px; margin: 0 auto; padding: 18px 24px; display:flex; flex-direction:column; gap:10px; }
 
-  /* Pills ABOVE the search bar (3-column grid) */
   .pills { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:12px; margin-bottom:10px; }
   .pill { display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--pill-border); background:#fff; padding:12px 14px; border-radius:999px; font-size:15px; cursor:pointer; line-height:1.2; min-height:44px; text-align:center; white-space:normal; word-break:break-word; }
 
-  /* Bubbles inside centered column; align left/right */
   .bubble { padding:12px 14px; border:1px solid var(--border); border-radius:14px; line-height:1.45; width: fit-content; max-width:100%; }
   .bot  { background:#fafafa; align-self:flex-start; }
   .user { background:#fff; align-self:flex-end; border-color:#ddd; }
 
-  /* Composer locked to column width */
   .composer-wrap { border-top:1px solid var(--border); }
   .composer-row { max-width:780px; margin: 0 auto; padding:12px 24px; }
   .composer { display:flex; align-items:center; gap:10px; width:100%; border:1px solid var(--border); border-radius:16px; padding:8px 12px; background:#fff; }
@@ -815,7 +940,6 @@ function handleTypeChange(value, fromHero) {
 
   document.getElementById('chat').innerHTML = '';
   renderTypePills();
-  // intentionally no "Filtering to..." message
 }
 
 function renderTypePills() {
@@ -846,14 +970,13 @@ async function listSessions() {
 async function newChat(silent=false) {
   const data = await fetch('/sessions/new', {method:'POST'}).then(r=>r.json());
   SESSION_ID = data.session_id;
-  if (!silent) { /* go to home on New chat */ goHome(); }
+  if (!silent) { goHome(); }
   await listSessions();
 }
 
 async function loadSession(id) {
   const data = await fetch('/sessions/'+id).then(r=>r.json());
   SESSION_ID = id;
-  // open chat view
   document.getElementById('hero').style.display = 'none';
   document.getElementById('topbar').style.display = 'flex';
   document.getElementById('chatContent').style.display = 'flex';
@@ -913,3 +1036,4 @@ boot();
 </body>
 </html>
     """)
+```
