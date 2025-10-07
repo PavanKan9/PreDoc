@@ -1,6 +1,3 @@
-Here’s a drop-in replacement for your `main.py` with an explicit red-flag detector that triggers the exact message you specified whenever a user’s question mentions those issues (including common synonyms and numeric fever checks in °F or °C).
-
-```python
 # main.py
 from fastapi import FastAPI, UploadFile, File, Query
 from pathlib import Path
@@ -396,13 +393,9 @@ def adaptive_followups(last_q: str, answer: str, selected_type: str) -> List[str
 
 # ========= RED FLAG DETECTION =========
 RED_FLAG_MESSAGE = (
-    "This may be a red flag. Please contact the clinic directly: "
-    "SF (415) 353-6400 / Marin (415) 886-8538"
+    "This may be a red flag. Please contact the clinic directly: SF (415) 353-6400 / Marin (415) 886-8538"
 )
 
-# Precompile helpful regexes
-RE_DEG = re.compile(r"[°\s]*([fFcC])?")
-RE_NUMBER = re.compile(r"(\d{2,3}(?:\.\d+)?)")
 RE_FEVER_LINE = re.compile(
     r"\b(?:temp(?:erature)?|fever)\b[^0-9a-zA-Z]{0,10}"
     r"(?:is|at|of|=|>|greater than|over|above)?[^0-9a-zA-Z]{0,10}"
@@ -416,30 +409,22 @@ def _c_to_f(c: float) -> float:
 def _fever_over_threshold(text: str, threshold_f: float = 100.4) -> bool:
     for m in RE_FEVER_LINE.finditer(text):
         val = float(m.group(1))
-        unit = m.group(2).strip().lower() if m.group(2) else ""
-        if "c" in unit:
-            val_f = _c_to_f(val)
-        else:
-            val_f = val
+        unit = (m.group(2) or "").strip().lower()
+        val_f = _c_to_f(val) if "c" in unit else val
         if val_f >= threshold_f:
             return True
-    # Catch phrases like "high fever", "spiking fever" (without number)
     if re.search(r"\b(high|spiking|worsening)\s+fever\b", text, re.IGNORECASE):
+        return True
+    if re.search(r"\bfever\b.*\b101\b", text, re.IGNORECASE):
         return True
     return False
 
 def _time_days_mentioned(text: str) -> Optional[int]:
-    m = re.search(r"\b(?:day|days)\s*(\d{1,2})\b", text, re.IGNORECASE)
+    m = re.search(r"\bfor\s*(\d{1,2})\s*days\b", text, re.IGNORECASE) or \
+        re.search(r"\b(\d{1,2})\s*(?:day|days)\b", text, re.IGNORECASE)
     if m:
         try:
             return int(m.group(1))
-        except Exception:
-            return None
-    # also "for X days"
-    m2 = re.search(r"\bfor\s*(\d{1,2})\s*days\b", text, re.IGNORECASE)
-    if m2:
-        try:
-            return int(m2.group(1))
         except Exception:
             return None
     return None
@@ -447,21 +432,21 @@ def _time_days_mentioned(text: str) -> Optional[int]:
 def is_red_flag(user_text: str) -> bool:
     t = (user_text or "").lower().strip()
 
-    # 1) Fever / elevated temperature >= 100.4 F (handles C or F, numeric or phrases)
+    # Fever >= 100.4 F (handles C or F)
     if _fever_over_threshold(t):
         return True
 
-    # 2) New onset / worsening redness
+    # New onset / worsening redness
     if re.search(r"\b(new(?:\s+onset)?|worsening|increasing)\s+red(?:ness)?\b", t, re.IGNORECASE):
         return True
 
-    # 3) Redness leading/spreading/streaking from wound/incision
+    # Redness tracking/streaking from wound or incision
     if re.search(r"\b(red(?:ness)?\s+(?:leading|tracking|spreading|streaking)\s+(?:from|away\s+from)\s+(?:the\s+)?(wound|incision|site))\b", t, re.IGNORECASE):
         return True
     if re.search(r"\bred\s+streaks?\b", t, re.IGNORECASE):
         return True
 
-    # 4) Drainage beyond 4 days
+    # Drainage beyond 4 days
     if re.search(r"\b(drainage|discharge|leakage|leaking|fluid|ooze|oozing|seep(?:age)?)\b", t, re.IGNORECASE):
         days = _time_days_mentioned(t)
         if days is not None and days >= 5:
@@ -469,27 +454,25 @@ def is_red_flag(user_text: str) -> bool:
         if re.search(r"\b(beyond|after|past|more than)\s*(?:four|4)\s*days\b", t, re.IGNORECASE):
             return True
 
-    # 5) Foul-smelling drainage or pus at any time
+    # Foul-smelling drainage or pus at any time
     if re.search(r"\b(foul|bad|smelly|malodor(?:ous)?)\b.*\b(drainage|discharge|odor|smell)\b", t, re.IGNORECASE):
         return True
     if re.search(r"\b(pus|purulent)\b", t, re.IGNORECASE):
         return True
 
-    # 6) Opening of the incision (dehiscence, gaping, split)
+    # Opening of the incision
     if re.search(r"\b(open(?:ing)?|opened|split|splitting|gaping|came\s+open|dehisc(?:e|ed|ence))\b.*\b(incision|wound|stitches|portal)\b", t, re.IGNORECASE):
         return True
 
-    # 7) Worsening pain
+    # Worsening pain
     if re.search(r"\b(pain\s+is\s+getting\s+worse|worsening\s+pain|pain\s+got\s+worse|increasing\s+pain|pain\s+is\s+worse)\b", t, re.IGNORECASE):
         return True
 
-    # Additional phrasing for examples like "fluid leakage", "fever 101"
+    # Additional phrasing examples
     if re.search(r"\bfluid\s+leak(age|ing)?\b", t, re.IGNORECASE):
         days = _time_days_mentioned(t)
         if days is None or days >= 5:
             return True
-    if re.search(r"\bfever\b.*\b101\b", t, re.IGNORECASE):
-        return True
 
     return False
 
@@ -599,7 +582,6 @@ def classify_chunk(text: str) -> str:
 def sessions():
     out = []
     for k, v in SESSIONS.items():
-        # Only include real chats with at least one message
         if not v.get("messages"):
             continue
         title = v.get("title") or "Untitled chat"
@@ -613,7 +595,6 @@ def sessions():
 @app.post("/sessions/new")
 def new_session():
     sid = uuid.uuid4().hex[:10]
-    # Create session but leave it empty; it won't show in sidebar until there's a message
     SESSIONS[sid] = {"title": "", "messages": [], "selected_type": None}
     return {"session_id": sid}
 
@@ -623,18 +604,13 @@ def read_session(sid: str):
     return {"messages": sess["messages"]}
 
 # ========= Ask =========
-class AskBody(BaseModel):
-    question: str
-    session_id: Optional[str] = None
-    selected_type: Optional[str] = None
-
 @app.post("/ask")
 def ask(body: AskBody):
     q_raw = (body.question or "").strip()
     if not q_raw:
         return {"answer": "Please enter a question.", "pills": [], "unverified": False}
 
-    # RED-FLAG CHECK (runs before general safety so it always reaches the user)
+    # Red-flag check (priority)
     if is_red_flag(q_raw):
         sid = body.session_id or uuid.uuid4().hex[:10]
         if sid not in SESSIONS:
@@ -645,7 +621,6 @@ def ask(body: AskBody):
         SESSIONS[sid]["messages"].append({"role": "assistant", "content": RED_FLAG_MESSAGE})
         return {"answer": RED_FLAG_MESSAGE, "pills": [], "unverified": False, "session_id": sid}
 
-    # General safety (non-medical policy etc.)
     safety = triage_flags(q_raw)
     if safety.get("blocked"):
         return {"answer": "I can’t help with that request.", "pills": [], "unverified": False}
@@ -660,7 +635,6 @@ def ask(body: AskBody):
     selected_type = body.selected_type or "General (All Types)"
     SESSIONS[sid]["selected_type"] = selected_type
 
-    # Retrieval
     queries = expand_query_variants(q_raw, selected_type)
     pairs = _retrieve_rich(queries, n=12, topic="shoulder", selected_type=selected_type)
 
@@ -778,11 +752,7 @@ def home():
   }
   .app { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100vh; width:100vw; }
 
-  .sidebar {
-    background: var(--sidebar-bg);
-    border-right:1px solid var(--border);
-    padding:16px 14px; overflow:auto;
-  }
+  .sidebar { background: var(--sidebar-bg); border-right:1px solid var(--border); padding:16px 14px; overflow:auto; }
   .home-logo { display:flex; align-items:center; justify-content:center; padding:6px 4px 10px; cursor:pointer; user-select:none; }
   .home-logo img { width:100%; max-width: 200px; height:auto; object-fit:contain; }
   .new-chat { display:block; width:100%; padding:10px 12px; margin-bottom:14px; border:1px solid var(--border); border-radius:12px; background:#fff; cursor:pointer; font-weight:600; }
@@ -791,7 +761,6 @@ def home():
   .skeleton:nth-child(2) { width:70%; } .skeleton:nth-child(3) { width:60%; }
 
   .main { display:flex; flex-direction:column; min-width:0; }
-
   .hero { flex:1; display:flex; align-items:center; justify-content:center; padding:40px 20px; }
   .hero-inner { text-align:center; max-width:820px; }
   .hero .badge { display:inline-block; padding:6px 12px; border-radius:999px; background:var(--orange-soft); color:#9a4b00; font-weight:700; font-size:12px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:14px; }
@@ -802,18 +771,17 @@ def home():
   .hero select { min-width:280px; border:2px solid var(--orange); border-radius:12px; padding:10px 12px; background:#fff; color:inherit; }
 
   .topbar { display:none; align-items:center; justify-content:center; padding:16px 18px; border-bottom:1px solid var(--border); position:relative; }
-  .title { font-size:22px; font-weight:700; letter-spacing:.2px; }
+  .title { font-size:22px; font-weight:700; }
   .topic-chip { position:absolute; right:18px; top:12px; background:#fff; border:1px solid var(--chip-border); color:#333; padding:8px 14px; border-radius:999px; font-size:13px; display:flex; align-items:center; gap:8px; cursor:pointer; }
   .topic-panel { position:absolute; right:18px; top:52px; background:#fff; border:1px solid var(--border); border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:10px; display:none; z-index:10; }
   .topic-panel select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; min-width:240px; }
 
   .content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
-
   .chat-wrap { flex:1; overflow:auto; }
   .chat-col { max-width: 780px; margin: 0 auto; padding: 18px 24px; display:flex; flex-direction:column; gap:10px; }
 
   .pills { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:12px; margin-bottom:10px; }
-  .pill { display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--pill-border); background:#fff; padding:12px 14px; border-radius:999px; font-size:15px; cursor:pointer; line-height:1.2; min-height:44px; text-align:center; white-space:normal; word-break:break-word; }
+  .pill { display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--pill-border); background:#fff; padding:12px 14px; border-radius:999px; font-size:15px; cursor:pointer; line-height:1.2; min-height:44px; text-align:center; }
 
   .bubble { padding:12px 14px; border:1px solid var(--border); border-radius:14px; line-height:1.45; width: fit-content; max-width:100%; }
   .bot  { background:#fafafa; align-self:flex-start; }
@@ -843,7 +811,6 @@ def home():
   </aside>
 
   <main class="main">
-    <!-- HERO (homescreen) -->
     <section class="hero" id="hero">
       <div class="hero-inner">
         <div class="badge">Shoulder</div>
@@ -856,7 +823,6 @@ def home():
       </div>
     </section>
 
-    <!-- CHAT VIEW -->
     <div class="topbar" id="topbar">
       <div class="title">Patient Education</div>
       <div class="topic-chip" id="topicChip" onclick="toggleTopicPanel()">
@@ -874,9 +840,7 @@ def home():
 
       <div class="composer-wrap">
         <div class="composer-row">
-          <!-- Pills now sit right above the search bar -->
           <div class="pills" id="pills"></div>
-
           <div class="composer">
             <input id="q" placeholder="Ask about your shoulder..." onkeydown="if(event.key==='Enter') ask()"/>
             <button class="fab" onclick="ask()" title="Send">
@@ -924,7 +888,7 @@ async function boot() {
   selTop.addEventListener('change', () => handleTypeChange(selTop.value, false));
 
   await listSessions();
-  await newChat(true); // create session on boot; hidden until it has messages
+  await newChat(true);
 }
 
 function handleTypeChange(value, fromHero) {
@@ -1036,4 +1000,3 @@ boot();
 </body>
 </html>
     """)
-```
